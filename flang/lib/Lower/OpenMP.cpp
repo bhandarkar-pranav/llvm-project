@@ -1655,7 +1655,7 @@ bool ClauseProcessor::processDepend(
                   llvm::StringRef(Fortran::parser::ParseTreeDumper::GetNodeName(
                                       *dependClause))
                       .upper() +
-                  " clause of a target or task directive");
+              " clause of a target or task directive", false);
         }
 
         const std::list<Fortran::parser::Designator> &depVal =
