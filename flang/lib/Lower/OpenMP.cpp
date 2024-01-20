@@ -1651,7 +1651,7 @@ bool ClauseProcessor::processDepend(
       [&](const ClauseTy::Depend *dependClause,
           const Fortran::parser::CharBlock &) {
         llvm::errs() << "Depend clause\n";
-        // Fortran::parser::DumpTree(llvm::errs(), *dependClause);
+        Fortran::parser::DumpTree(llvm::errs(), *dependClause);
         if (std::holds_alternative<Fortran::parser::OmpDependClause::Source>(
                 dependClause->v.u) ||
             std::holds_alternative<Fortran::parser::OmpDependClause::Sink>(
@@ -2686,7 +2686,8 @@ genTargetOp(Fortran::lower::AbstractConverter &converter,
   Fortran::lower::StatementContext stmtCtx;
   mlir::Value ifClauseOperand, deviceOperand, threadLimitOperand;
   mlir::UnitAttr nowaitAttr;
-  llvm::SmallVector<mlir::Value> mapOperands;
+  llvm::SmallVector<mlir::Attribute> dependTypeOperands;
+  llvm::SmallVector<mlir::Value> mapOperands, dependOperands;
   llvm::SmallVector<mlir::Type> mapSymTypes;
   llvm::SmallVector<mlir::Location> mapSymLocs;
   llvm::SmallVector<const Fortran::semantics::Symbol *> mapSymbols;
@@ -2699,8 +2700,8 @@ genTargetOp(Fortran::lower::AbstractConverter &converter,
   cp.processNowait(nowaitAttr);
   cp.processMap(currentLocation, directive, semanticsContext, stmtCtx,
                 mapOperands, &mapSymTypes, &mapSymLocs, &mapSymbols);
+  cp.processDepend(dependTypeOperands, dependOperands);
   cp.processTODO<Fortran::parser::OmpClause::Private,
-                 Fortran::parser::OmpClause::Depend,
                  Fortran::parser::OmpClause::Firstprivate,
                  Fortran::parser::OmpClause::IsDevicePtr,
                  Fortran::parser::OmpClause::HasDeviceAddr,
@@ -2710,7 +2711,16 @@ genTargetOp(Fortran::lower::AbstractConverter &converter,
                  Fortran::parser::OmpClause::UsesAllocators,
                  Fortran::parser::OmpClause::Defaultmap>(
       currentLocation, llvm::omp::Directive::OMPD_target);
-
+  llvm::errs() << "dependTypeOperands.empty() == " << dependTypeOperands.empty() <<
+      "\n";
+  llvm::errs() << "dependTypeOperands.size() => " << dependTypeOperands.size() << "\n";
+  llvm::errs() << "dependOperands.size() => " << dependOperands.size() << "\n";
+  for (auto &d : dependTypeOperands) {
+    d.dump();
+  }
+  for (auto &d : dependOperands) {
+    d.dump();
+  }
   // 5.8.1 Implicit Data-Mapping Attribute Rules
   // The following code follows the implicit data-mapping rules to map all the
   // symbols used inside the region that have not been explicitly mapped using
@@ -2778,7 +2788,11 @@ genTargetOp(Fortran::lower::AbstractConverter &converter,
 
   auto targetOp = converter.getFirOpBuilder().create<mlir::omp::TargetOp>(
       currentLocation, ifClauseOperand, deviceOperand, threadLimitOperand,
-      nowaitAttr, mapOperands);
+      dependTypeOperands.empty()
+          ? nullptr
+          : mlir::ArrayAttr::get(converter.getFirOpBuilder().getContext(),
+                                 dependTypeOperands),
+      dependOperands, nowaitAttr, mapOperands);
 
   genBodyOfTargetOp(converter, eval, targetOp, mapSymTypes, mapSymLocs,
                     mapSymbols, currentLocation);
