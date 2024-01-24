@@ -977,7 +977,11 @@ LogicalResult UpdateDataOp::verify() {
 }
 
 LogicalResult TargetOp::verify() {
-  return verifyMapClause(*this, getMapOperands());
+  LogicalResult verifyDependVars =
+      verifyDependVarList(*this, getDepends(), getDependVars());
+  return failed(verifyDependVars)
+             ? verifyDependVars
+             : verifyMapClause(*this, getMapOperands());
 }
 
 //===----------------------------------------------------------------------===//
