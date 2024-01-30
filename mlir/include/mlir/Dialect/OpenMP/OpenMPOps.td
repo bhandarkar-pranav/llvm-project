@@ -1360,11 +1360,17 @@ def Target_EnterDataOp: OpenMP_Op<"target_enter_data",
 
     The $map_types specifies the types and modifiers for the map clause.
 
-    TODO:  depend clause and map_type_modifier values iterator and mapper.
+    The `depends` and `depend_vars` arguments are variadic lists of values
+    that specify the dependencies of this particular target task in relation to
+    other tasks.
+
+    TODO:  map_type_modifier values iterator and mapper.
   }];
 
   let arguments = (ins Optional<I1>:$if_expr,
                        Optional<AnyInteger>:$device,
+                       OptionalAttr<TaskDependArrayAttr>:$depends,
+                       Variadic<OpenMP_PointerLikeType>:$depend_vars,
                        UnitAttr:$nowait,
                        Variadic<AnyType>:$map_operands);
 
@@ -1373,6 +1379,7 @@ def Target_EnterDataOp: OpenMP_Op<"target_enter_data",
     | `device` `(` $device `:` type($device) `)`
     | `nowait` $nowait
     | `map_entries` `(` $map_operands `:` type($map_operands) `)`
+    | `depend` `(` custom<DependVarList>($depend_vars, type($depend_vars), $depends) `)`
     ) attr-dict
    }];
 
@@ -1406,11 +1413,17 @@ def Target_ExitDataOp: OpenMP_Op<"target_exit_data",
 
     The $map_types specifies the types and modifiers for the map clause.
 
-    TODO:  depend clause and map_type_modifier values iterator and mapper.
+    The `depends` and `depend_vars` arguments are variadic lists of values
+    that specify the dependencies of this particular target task in relation to
+    other tasks.
+
+    TODO: map_type_modifier values iterator and mapper.
   }];
 
   let arguments = (ins Optional<I1>:$if_expr,
                        Optional<AnyInteger>:$device,
+                       OptionalAttr<TaskDependArrayAttr>:$depends,
+                       Variadic<OpenMP_PointerLikeType>:$depend_vars,
                        UnitAttr:$nowait,
                        Variadic<AnyType>:$map_operands);
 
@@ -1419,6 +1432,7 @@ def Target_ExitDataOp: OpenMP_Op<"target_exit_data",
     | `device` `(` $device `:` type($device) `)`
     | `nowait` $nowait
     | `map_entries` `(` $map_operands `:` type($map_operands) `)`
+    | `depend` `(` custom<DependVarList>($depend_vars, type($depend_vars), $depends) `)`
     ) attr-dict
    }];
 
@@ -1456,11 +1470,16 @@ def Target_UpdateDataOp: OpenMP_Op<"target_update_data",
     during verification to make sure the restrictions for target update are
     respected.
 
-    TODO: depend clause
+    The `depends` and `depend_vars` arguments are variadic lists of values
+    that specify the dependencies of this particular target task in relation to
+    other tasks.
+
   }];
 
   let arguments = (ins Optional<I1>:$if_expr,
                        Optional<AnyInteger>:$device,
+                       OptionalAttr<TaskDependArrayAttr>:$depends,
+                       Variadic<OpenMP_PointerLikeType>:$depend_vars,
                        UnitAttr:$nowait,
                        Variadic<OpenMP_PointerLikeType>:$motion_operands);
 
@@ -1469,6 +1488,7 @@ def Target_UpdateDataOp: OpenMP_Op<"target_update_data",
     | `device` `(` $device `:` type($device) `)`
     | `nowait` $nowait
     | `motion_entries` `(` $motion_operands `:` type($motion_operands) `)`
+    | `depend` `(` custom<DependVarList>($depend_vars, type($depend_vars), $depends) `)`
     ) attr-dict
    }];
 

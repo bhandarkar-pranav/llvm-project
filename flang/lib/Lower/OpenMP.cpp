@@ -2674,7 +2674,8 @@ genEnterExitUpdateDataOp(Fortran::lower::AbstractConverter &converter,
   Fortran::lower::StatementContext stmtCtx;
   mlir::Value ifClauseOperand, deviceOperand;
   mlir::UnitAttr nowaitAttr;
-  llvm::SmallVector<mlir::Value> mapOperands;
+  llvm::SmallVector<mlir::Value> mapOperands, dependOperands;
+  llvm::SmallVector<mlir::Attribute> dependTypeOperands;
 
   Fortran::parser::OmpIfClause::DirectiveNameModifier directiveName;
   llvm::omp::Directive directive;
@@ -2709,12 +2710,15 @@ genEnterExitUpdateDataOp(Fortran::lower::AbstractConverter &converter,
     cp.processMap(currentLocation, directive, semanticsContext, stmtCtx,
                   mapOperands);
   }
-
-  cp.processTODO<Fortran::parser::OmpClause::Depend>(currentLocation,
-                                                     directive);
+  cp.processDepend(dependTypeOperands, dependOperands);
 
   return firOpBuilder.create<OpTy>(currentLocation, ifClauseOperand,
-                                   deviceOperand, nowaitAttr, mapOperands);
+                                   deviceOperand,
+                                   dependTypeOperands.empty()
+                                   ? nullptr
+                                   : mlir::ArrayAttr::get(converter.getFirOpBuilder().getContext(),
+                                                          dependTypeOperands),
+                                   dependOperands,nowaitAttr, mapOperands);
 }
 
 // This functions creates a block for the body of the targetOp's region. It adds
