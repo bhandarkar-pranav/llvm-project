@@ -2712,13 +2712,13 @@ genEnterExitUpdateDataOp(Fortran::lower::AbstractConverter &converter,
   }
   cp.processDepend(dependTypeOperands, dependOperands);
 
-  return firOpBuilder.create<OpTy>(currentLocation, ifClauseOperand,
-                                   deviceOperand,
-                                   dependTypeOperands.empty()
-                                   ? nullptr
-                                   : mlir::ArrayAttr::get(converter.getFirOpBuilder().getContext(),
-                                                          dependTypeOperands),
-                                   dependOperands,nowaitAttr, mapOperands);
+  return firOpBuilder.create<OpTy>(
+      currentLocation, ifClauseOperand, deviceOperand,
+      dependTypeOperands.empty()
+          ? nullptr
+          : mlir::ArrayAttr::get(converter.getFirOpBuilder().getContext(),
+                                 dependTypeOperands),
+      dependOperands, nowaitAttr, mapOperands);
 }
 
 // This functions creates a block for the body of the targetOp's region. It adds
