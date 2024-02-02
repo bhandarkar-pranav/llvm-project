@@ -2985,6 +2985,14 @@ def fmodule_output : Flag<["-"], "fmodule-output">, Flags<[NoXarchOption]>,
   Visibility<[ClangOption, CC1Option]>,
   HelpText<"Save intermediate module file results when compiling a standard C++ module unit.">;
 
+defm skip_odr_check_in_gmf : BoolOption<"f", "skip-odr-check-in-gmf",
+  LangOpts<"SkipODRCheckInGMF">, DefaultFalse,
+  PosFlag<SetTrue, [], [CC1Option],
+          "Skip ODR checks for decls in the global module fragment.">,
+  NegFlag<SetFalse, [], [CC1Option],
+          "Perform ODR checks for decls in the global module fragment.">>,
+  Group<f_Group>;
+
 def fmodules_prune_interval : Joined<["-"], "fmodules-prune-interval=">, Group<i_Group>,
   Visibility<[ClangOption, CC1Option]>, MetaVarName<"<seconds>">,
   HelpText<"Specify the interval (in seconds) between attempts to prune the module cache">,
@@ -3980,6 +3988,10 @@ defm function_sections : BoolFOption<"function-sections",
   PosFlag<SetTrue, [], [ClangOption, CC1Option],
           "Place each function in its own section">,
   NegFlag<SetFalse>>;
+defm basic_block_address_map : BoolFOption<"basic-block-address-map",
+  CodeGenOpts<"BBAddrMap">, DefaultFalse,
+  PosFlag<SetTrue, [], [CC1Option], "Emit the basic block address map section.">,
+  NegFlag<SetFalse>>;
 def fbasic_block_sections_EQ : Joined<["-"], "fbasic-block-sections=">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option, CC1AsOption]>,
   HelpText<"Place each function's basic blocks in unique sections (ELF Only)">,
@@ -4619,6 +4631,10 @@ def munaligned_access : Flag<["-"], "munaligned-access">, Group<m_Group>,
   HelpText<"Allow memory accesses to be unaligned (AArch32/AArch64/LoongArch/RISC-V only)">;
 def mno_unaligned_access : Flag<["-"], "mno-unaligned-access">, Group<m_Group>,
   HelpText<"Force all memory accesses to be aligned (AArch32/AArch64/LoongArch/RISC-V only)">;
+def munaligned_symbols : Flag<["-"], "munaligned-symbols">, Group<m_Group>,
+  HelpText<"Expect external char-aligned symbols to be without ABI alignment (SystemZ only)">;
+def mno_unaligned_symbols : Flag<["-"], "mno-unaligned-symbols">, Group<m_Group>,
+  HelpText<"Expect external char-aligned symbols to be without ABI alignment (SystemZ only)">;
 } // let Flags = [TargetSpecific]
 def mstrict_align : Flag<["-"], "mstrict-align">, Alias<mno_unaligned_access>,
   Flags<[HelpHidden]>, Visibility<[ClangOption, CC1Option]>,
