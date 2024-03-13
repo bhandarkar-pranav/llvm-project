@@ -101,6 +101,13 @@ public:
       llvm::SmallVectorImpl<mlir::Attribute> &copyPrivateFuncs) const;
   bool processDepend(llvm::SmallVectorImpl<mlir::Attribute> &dependTypeOperands,
                      llvm::SmallVectorImpl<mlir::Value> &dependOperands) const;
+
+  // This is a special case of processDepend that processes the depend
+  // clause on Target ops - TargetOp, EnterDataOp, ExitDataOp, UpdateDataOp
+  // It sets up the generation of MLIR code for the target construct
+  // in question by first creating an enclosing omp.task operation and transfers
+  // the 'depend' clause and its arguments to this new omp.task operation.
+  bool processTargetDepend(mlir::Location currentLocation) const;
   bool
   processEnter(llvm::SmallVectorImpl<DeclareTargetCapturePair> &result) const;
   bool
