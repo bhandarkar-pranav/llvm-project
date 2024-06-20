@@ -5039,6 +5039,20 @@ createImplicitFirstprivateForType(ASTContext &C, OMPTaskDataTy &Data,
   PrivateVD->setInit(ImplicitCastExpr::Create(C, ElemType, CK_LValueToRValue,
                                               InitRef, /*BasePath=*/nullptr,
                                               VK_PRValue, FPOptionsOverride()));
+
+  LLVM_DEBUG(llvm::dbgs() << "***createImplicitFirstprivateForType***\n");
+  LLVM_DEBUG(llvm::dbgs() << "OrigVD:-> ");
+  LLVM_DEBUG(InitVD->dump());
+  LLVM_DEBUG(llvm::dbgs() << "Data.FirstPrivateVars.emplace_back(OrigRef):->");
+  LLVM_DEBUG(OrigRef->dump());
+  LLVM_DEBUG(llvm::dbgs() << "PrivateVD:-> ");
+  LLVM_DEBUG(PrivateVD->dump());
+  LLVM_DEBUG(llvm::dbgs() << "Data.FirstPrivateCopies(PrivateRef):->");
+  LLVM_DEBUG(PrivateRef->dump());
+  LLVM_DEBUG(llvm::dbgs() << "InitVD:-> ");
+  LLVM_DEBUG(InitVD->dump());
+  LLVM_DEBUG(llvm::dbgs() << "Data.FirstPrivateInits(InitRef):->");
+  LLVM_DEBUG(InitRef->dump());
   Data.FirstprivateVars.emplace_back(OrigRef);
   Data.FirstprivateCopies.emplace_back(PrivateRef);
   Data.FirstprivateInits.emplace_back(InitRef);
@@ -5054,6 +5068,9 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
     OMPTargetDataInfo &InputInfo) {
   // Emit outlined function for task construct.
   const CapturedStmt *CS = S.getCapturedStmt(OMPD_task);
+  LLVM_DEBUG(llvm::dbgs()
+             << "(EmitOMPTargetTaskBasedDirective): CapturedStmt CS = \n");
+  LLVM_DEBUG(CS->dump());
   Address CapturedStruct = GenerateCapturedStmtArgument(*CS);
   QualType SharedsTy = getContext().getRecordType(CS->getCapturedRecordDecl());
   auto I = CS->getCapturedDecl()->param_begin();
@@ -5086,17 +5103,32 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
     RHSs.append(C->rhs_exprs().begin(), C->rhs_exprs().end());
   }
   OMPPrivateScope TargetScope(*this);
+  // BasePointersArrayVariableDeclaration
   VarDecl *BPVD = nullptr;
+  // PointersVariableDeclaration
   VarDecl *PVD = nullptr;
+  // SizesVariableDeclaration
   VarDecl *SVD = nullptr;
+  // MappersVariableDeclaration
   VarDecl *MVD = nullptr;
   if (InputInfo.NumberOfTargetItems > 0) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "(EmitOMPTargetTaskBasedDirective) NumberOfTargetItems = "
+               << InputInfo.NumberOfTargetItems << "\n");
     auto *CD = CapturedDecl::Create(
         getContext(), getContext().getTranslationUnitDecl(), /*NumParams=*/0);
+    LLVM_DEBUG(llvm::dbgs()
+               << "(EmitOMPTargetTaskBasedDirective): CapturedDecl *CD = \n");
+    LLVM_DEBUG(CD->dump());
     llvm::APInt ArrSize(/*numBits=*/32, InputInfo.NumberOfTargetItems);
     QualType BaseAndPointerAndMapperType = getContext().getConstantArrayType(
         getContext().VoidPtrTy, ArrSize, nullptr, ArraySizeModifier::Normal,
         /*IndexTypeQuals=*/0);
+
+    LLVM_DEBUG(
+        llvm::dbgs()
+        << "(EmitOMPTargetTaskBasedDirective): BaseAndPointerAndMapperType = "
+        << BaseAndPointerAndMapperType << "\n");
     BPVD = createImplicitFirstprivateForType(
         getContext(), Data, BaseAndPointerAndMapperType, CD, S.getBeginLoc());
     PVD = createImplicitFirstprivateForType(
@@ -5110,6 +5142,9 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
     TargetScope.addPrivate(BPVD, InputInfo.BasePointersArray);
     TargetScope.addPrivate(PVD, InputInfo.PointersArray);
     TargetScope.addPrivate(SVD, InputInfo.SizesArray);
+    LLVM_DEBUG(llvm::dbgs()
+               << "(EmitOMPTargetTaskBasedDirective): CapturedDecl *CD = \n");
+    LLVM_DEBUG(CD->dump());
     // If there is no user-defined mapper, the mapper array will be nullptr. In
     // this case, we don't need to privatize it.
     if (!isa_and_nonnull<llvm::ConstantPointerNull>(
@@ -5188,6 +5223,9 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
   llvm::Function *OutlinedFn = CGM.getOpenMPRuntime().emitTaskOutlinedFunction(
       S, *I, *PartId, *TaskT, S.getDirectiveKind(), CodeGen, /*Tied=*/true,
       Data.NumberOfParts);
+  LLVM_DEBUG(llvm::dbgs()
+             << "(EmitOMPTargetTaskBasedDirective): TaskOutlinedFunction is:\n"
+             << *OutlinedFn << "\n");
   llvm::APInt TrueOrFalse(32, S.hasClausesOfKind<OMPNowaitClause>() ? 1 : 0);
   IntegerLiteral IfCond(getContext(), TrueOrFalse,
                         getContext().getIntTypeForBitwidth(32, /*Signed=*/0),
@@ -6640,6 +6678,11 @@ void CodeGenFunction::EmitOMPAtomicDirective(const OMPAtomicDirective &S) {
 static void emitCommonOMPTargetDirective(CodeGenFunction &CGF,
                                          const OMPExecutableDirective &S,
                                          const RegionCodeGenTy &CodeGen) {
+  LLVM_DEBUG(
+      llvm::dbgs() << "Module before target call is \n"
+                   << *CGF.Builder.GetInsertBlock()->getParent()->getParent());
+  LLVM_DEBUG(
+      llvm::dbgs() << "**************************************************\n");
   assert(isOpenMPTargetExecutionDirective(S.getDirectiveKind()));
   CodeGenModule &CGM = CGF.CGM;
 
@@ -6707,6 +6750,9 @@ static void emitCommonOMPTargetDirective(CodeGenFunction &CGF,
   // Emit target region as a standalone region.
   CGM.getOpenMPRuntime().emitTargetOutlinedFunction(S, ParentName, Fn, FnID,
                                                     IsOffloadEntry, CodeGen);
+
+  LLVM_DEBUG(llvm::dbgs() << "**** Target outlined function ****\n"
+                          << *Fn << "\n");
   OMPLexicalScope Scope(CGF, S, OMPD_task);
   auto &&SizeEmitter =
       [IsOffloadEntry](CodeGenFunction &CGF,
@@ -6723,6 +6769,13 @@ static void emitCommonOMPTargetDirective(CodeGenFunction &CGF,
   };
   CGM.getOpenMPRuntime().emitTargetCall(CGF, S, Fn, FnID, IfCond, Device,
                                         SizeEmitter);
+  LLVM_DEBUG(
+      llvm::dbgs() << "**************************************************\n");
+  LLVM_DEBUG(
+      llvm::dbgs() << "Module after target call is \n"
+                   << *CGF.Builder.GetInsertBlock()->getParent()->getParent());
+  LLVM_DEBUG(
+      llvm::dbgs() << "**************************************************\n");
 }
 
 static void emitTargetRegion(CodeGenFunction &CGF, const OMPTargetDirective &S,

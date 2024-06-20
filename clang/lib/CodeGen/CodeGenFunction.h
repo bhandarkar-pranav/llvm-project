@@ -3778,6 +3778,8 @@ public:
                                  const OpenMPDirectiveKind CapturedRegion,
                                  const RegionCodeGenTy &BodyGen,
                                  const TaskGenTy &TaskGen, OMPTaskDataTy &Data);
+  // Of course, WTF would we want to add comments about what the significance of
+  // this datastructure is.
   struct OMPTargetDataInfo {
     Address BasePointersArray = Address::invalid();
     Address PointersArray = Address::invalid();

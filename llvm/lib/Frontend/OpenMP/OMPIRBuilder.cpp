@@ -5234,6 +5234,37 @@ static void emitTargetOutlinedFunction(
                                       OutlinedFn, OutlinedFnID);
 }
 
+static void
+emitOffloadingArgs(OpenMPIRBuilder &OMPBuilder, IRBuilderBase &Builder,
+                   OpenMPIRBuilder::InsertPointTy AllocaIP,
+                   OpenMPIRBuilder::InsertPointTy CodeGenIP,
+                   OpenMPIRBuilder::MapInfosTy &MapInfo,
+                   OpenMPIRBuilder::TargetDataInfo &Info,
+                   OpenMPIRBuilder::TargetDataRTArgs &RTArgs,
+                   OpenMPIRBuilder::GenMapInfoCallbackTy GenMapInfoCB) {
+
+  MapInfo = GenMapInfoCB(Builder.saveIP());
+  OMPBuilder.emitOffloadingArrays(AllocaIP, Builder.saveIP(), MapInfo, Info,
+                                  /*IsNonContiguous=*/true);
+
+  OMPBuilder.emitOffloadingArraysArgument(Builder, RTArgs, Info,
+                                          !MapInfo.Names.empty());
+}
+
+void OpenMPIRBuilder::emitTargetCall_(
+    InsertPointTy AllocaIP, Function *OutlinedFn, Constant *OutlinedFnID,
+    SmallVectorImpl<Value *> &Args, GenMapInfoCallbackTy GenMapInfoCB,
+    function_ref<void(unsigned int, Value *)> DeviceAddrCB,
+    function_ref<Value *(unsigned int)> CustomMapperCB) {
+
+  // Do nothing for now.
+}
+
+// PDB: Clang_equivalence todo-> This doesnt handle the if clause yet.
+// So everything that is happening here is what happens in the then part of
+// the if clause of target. This means this is the part that offloads.
+// To fix this, I think all we'll need to do is to use the
+// EmitTargetCallFallBackCB below
 static void emitTargetCall(OpenMPIRBuilder &OMPBuilder, IRBuilderBase &Builder,
                            OpenMPIRBuilder::InsertPointTy AllocaIP,
                            Function *OutlinedFn, Constant *OutlinedFnID,
@@ -5245,13 +5276,16 @@ static void emitTargetCall(OpenMPIRBuilder &OMPBuilder, IRBuilderBase &Builder,
       /*RequiresDevicePointerInfo=*/false,
       /*SeparateBeginEndCalls=*/true);
 
-  OpenMPIRBuilder::MapInfosTy &MapInfo = GenMapInfoCB(Builder.saveIP());
-  OMPBuilder.emitOffloadingArrays(AllocaIP, Builder.saveIP(), MapInfo, Info,
-                                  /*IsNonContiguous=*/true);
+  OpenMPIRBuilder::MapInfosTy MapInfo;
+  // OMPBuilder.emitOffloadingArrays(AllocaIP, Builder.saveIP(), MapInfo, Info,
+  //                                 /*IsNonContiguous=*/true);
 
   OpenMPIRBuilder::TargetDataRTArgs RTArgs;
-  OMPBuilder.emitOffloadingArraysArgument(Builder, RTArgs, Info,
-                                          !MapInfo.Names.empty());
+  // OMPBuilder.emitOffloadingArraysArgument(Builder, RTArgs, Info,
+  //                                         !MapInfo.Names.empty());
+
+  emitOffloadingArgs(OMPBuilder, Builder, AllocaIP, Builder.saveIP(), MapInfo,
+                     Info, RTArgs, GenMapInfoCB);
 
   //  emitKernelLaunch
   auto &&EmitTargetCallFallbackCB =
@@ -5563,14 +5597,15 @@ void OpenMPIRBuilder::emitNonContiguousDescriptor(InsertPointTy AllocaIP,
 }
 
 void OpenMPIRBuilder::emitOffloadingArrays(
-    InsertPointTy AllocaIP, InsertPointTy CodeGenIP, TargetDataInfo &Info,
-    GenMapInfoCallbackTy GenMapInfoCB, bool IsNonContiguous,
+    InsertPointTy AllocaIP, InsertPointTy CodeGenIP,
+    GenMapInfoCallbackTy GenMapInfoCB, TargetDataInfo &Info,
+    bool IsNonContiguous,
     function_ref<void(unsigned int, Value *)> DeviceAddrCB,
     function_ref<Value *(unsigned int)> CustomMapperCB) {
 
   OpenMPIRBuilder::MapInfosTy &MapInfo = GenMapInfoCB(CodeGenIP);
-  emitOffloadingArrays(AllocaIP, CodeGenIP, MapInfo,
-                       Info, IsNonContiguous, DeviceAddrCB, CustomMapperCB);
+  emitOffloadingArrays(AllocaIP, CodeGenIP, MapInfo, Info, IsNonContiguous,
+                       DeviceAddrCB, CustomMapperCB);
 }
 void OpenMPIRBuilder::emitOffloadingArrays(
     InsertPointTy AllocaIP, InsertPointTy CodeGenIP, MapInfosTy &CombinedInfo,

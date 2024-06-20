@@ -1789,12 +1789,23 @@ public:
   using GenMapInfoCallbackTy =
       function_ref<MapInfosTy &(InsertPointTy CodeGenIP)>;
 
+  void emitTargetCall_(
+      InsertPointTy AllocaIP, Function *OutlinedFn, Constant *OutlinedFnID,
+      SmallVectorImpl<Value *> &Args,
+      OpenMPIRBuilder::GenMapInfoCallbackTy GenMapInfoCB,
+      function_ref<void(unsigned int, Value *)> DeviceAddrCB = nullptr,
+      function_ref<Value *(unsigned int)> CustomMapperCB = nullptr);
+  void emitOffloadingArgs(
+      InsertPointTy AllocaIP, InsertPointTy CodeGenIP, MapInfosTy &MapInfo,
+      TargetDataRTArgs &RTArgs, GenMapInfoCallbackTy GenMapInfoCB,
+      function_ref<void(unsigned int, Value *)> DeviceAddrCB = nullptr,
+      function_ref<Value *(unsigned int)> CustomMapperCB = nullptr);
   /// Emit the arrays used to pass the captures and map information to the
   /// offloading runtime library. If there is no map or capture information,
   /// return nullptr by reference.
   void emitOffloadingArrays(
       InsertPointTy AllocaIP, InsertPointTy CodeGenIP,
-      TargetDataInfo &Info, GenMapInfoCallbackTy GenMapInfoCB,
+      GenMapInfoCallbackTy GenMapInfoCB, TargetDataInfo &Info,
       bool IsNonContiguous = false,
       function_ref<void(unsigned int, Value *)> DeviceAddrCB = nullptr,
       function_ref<Value *(unsigned int)> CustomMapperCB = nullptr);
@@ -1807,7 +1818,6 @@ public:
       TargetDataInfo &Info, bool IsNonContiguous = false,
       function_ref<void(unsigned int, Value *)> DeviceAddrCB = nullptr,
       function_ref<Value *(unsigned int)> CustomMapperCB = nullptr);
-
 
   /// Creates offloading entry for the provided entry ID \a ID, address \a
   /// Addr, size \a Size, and flags \a Flags.
@@ -2211,7 +2221,6 @@ public:
   /// pointers, we emit the body in between the runtime calls. This avoids
   /// duplicating the body code.
   enum BodyGenTy { Priv, DupNoPriv, NoPriv };
-
 
   /// Generator for '#omp target data'
   ///
