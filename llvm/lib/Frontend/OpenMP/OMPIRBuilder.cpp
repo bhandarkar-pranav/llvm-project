@@ -5418,12 +5418,14 @@ void OpenMPIRBuilder::emitTargetCall_(
 // // the if clause of target. This means this is the part that offloads.
 // // To fix this, I think all we'll need to do is to use the
 // // EmitTargetCallFallBackCB below
-// static void emitTargetCall(OpenMPIRBuilder &OMPBuilder, IRBuilderBase &Builder,
+// static void emitTargetCall(OpenMPIRBuilder &OMPBuilder, IRBuilderBase
+// &Builder,
 //                            OpenMPIRBuilder::InsertPointTy AllocaIP,
 //                            Function *OutlinedFn, Constant *OutlinedFnID,
 //                            int32_t NumTeams, int32_t NumThreads,
 //                            SmallVectorImpl<Value *> &Args,
-//                            OpenMPIRBuilder::GenMapInfoCallbackTy GenMapInfoCB) {
+//                            OpenMPIRBuilder::GenMapInfoCallbackTy
+//                            GenMapInfoCB) {
 
 OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::emitTargetTask(
     Function *OutlinedFn, Value *OutlinedFnID,
