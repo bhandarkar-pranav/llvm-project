@@ -4514,10 +4514,12 @@ void CGOpenMPRuntime::emitTaskCall(CodeGenFunction &CGF, SourceLocation Loc,
                                    const OMPTaskDataTy &Data) {
   if (!CGF.HaveInsertPoint())
     return;
-  LLVM_DEBUG(llvm::dbgs() << "**InsertPoint before emitTaskInit***\n" << *CGF.Builder.GetInsertBlock());
+  LLVM_DEBUG(llvm::dbgs() << "**InsertPoint before emitTaskInit***\n"
+                          << *CGF.Builder.GetInsertBlock());
   TaskResultTy Result =
       emitTaskInit(CGF, Loc, D, TaskFunction, SharedsTy, Shareds, Data);
-  LLVM_DEBUG(llvm::dbgs() << "**InsertPoint after emitTaskInit***\n" << *CGF.Builder.GetInsertBlock());
+  LLVM_DEBUG(llvm::dbgs() << "**InsertPoint after emitTaskInit***\n"
+                          << *CGF.Builder.GetInsertBlock());
   llvm::Value *NewTask = Result.NewTask;
   llvm::Function *TaskEntry = Result.TaskEntry;
   llvm::Value *NewTaskNewTaskTTy = Result.NewTaskNewTaskTTy;
@@ -9708,7 +9710,9 @@ static void emitTargetCallKernelLaunchNew(
         DeviceID, RTLoc, AllocaIP));
   };
 
-  LLVM_DEBUG(llvm::dbgs() << "calling function before targettaskbaseddirective is"  << *CGF.Builder.GetInsertBlock());
+  LLVM_DEBUG(
+      llvm::dbgs() << "calling function before targettaskbaseddirective is"
+                   << *CGF.Builder.GetInsertBlock());
   if (RequiresOuterTask) {
     if (NewClangTargetTaskCodeGen) {
       llvm::errs() << "Using OMPIRBuilder for target task codegen\n";
