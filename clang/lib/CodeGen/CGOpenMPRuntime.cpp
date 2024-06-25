@@ -3010,6 +3010,10 @@ emitProxyTaskFunction(CodeGenModule &CGM, SourceLocation Loc,
       CGM.getTypes().arrangeBuiltinFunctionDeclaration(KmpInt32Ty, Args);
   llvm::FunctionType *TaskEntryTy =
       CGM.getTypes().GetFunctionType(TaskEntryFnInfo);
+  LLVM_DEBUG(llvm::dbgs() << "TaskEntryTy=" << *TaskEntryTy << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "KmpTaskTWithPrivatesPtrQTy = "
+                          << KmpTaskTWithPrivatesPtrQTy << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "TaskTypeArg = " << TaskTypeArg << "\n");
   std::string Name = CGM.getOpenMPRuntime().getName({"omp_task_entry", ""});
   auto *TaskEntry = llvm::Function::Create(
       TaskEntryTy, llvm::GlobalValue::InternalLinkage, Name, &CGM.getModule());
@@ -3714,6 +3718,7 @@ CGOpenMPRuntime::emitTaskInit(CodeGenFunction &CGF, SourceLocation Loc,
       KmpTaskTWithPrivatesQTy, KmpTaskTQTy, SharedsPtrTy, TaskFunction,
       TaskPrivatesMap);
 
+  LLVM_DEBUG(llvm::dbgs() << "ProxyTaskFunction is " << *TaskEntry);
   // Build call kmp_task_t * __kmpc_omp_task_alloc(ident_t *, kmp_int32 gtid,
   // kmp_int32 flags, size_t sizeof_kmp_task_t, size_t sizeof_shareds,
   // kmp_routine_entry_t *task_entry);
@@ -9595,43 +9600,25 @@ static void emitTargetCallKernelLaunchNew(
     }
     return MFunc;
   };
-  // Fill up the arrays and create the arguments.
-  LLVM_DEBUG(llvm::dbgs() << "emitTargetCallKernelLaunchNew:InsertBlock before "
-                             "emitting offload arrays: "
-                          << *CGF.Builder.GetInsertBlock() << "\n");
-  if (Info.RTArgs.BasePointersArray) {
-    LLVM_DEBUG(llvm::dbgs() << "Info.RTArgs.BasePointersArray = "
-                            << *Info.RTArgs.BasePointersArray << "\n");
-  } else {
-    LLVM_DEBUG(llvm::dbgs() << "Info.RTArgs.BasePointersArray is nullptr\n");
-  }
-  OMPBuilder.emitOffloadingArrays(
-      llvm::OpenMPIRBuilder::InsertPointTy(CGF.AllocaInsertPt->getParent(),
-                                           CGF.AllocaInsertPt->getIterator()),
-      CGF.Builder.saveIP(), GenMapInfoCB, Info, /*IsNonContiguous=*/true,
+  // // Fill up the arrays and create the arguments.
+  // OMPBuilder.emitOffloadingArrays(
+  //     llvm::OpenMPIRBuilder::InsertPointTy(CGF.AllocaInsertPt->getParent(),
+  //                                          CGF.AllocaInsertPt->getIterator()),
+  //     CGF.Builder.saveIP(), GenMapInfoCB, Info, /*IsNonContiguous=*/true,
+  //     DeviceAddrCB, CustomMapperCB);
+
+  // Info.EmitDebug = !CombinedInfo.Names.empty();
+
+  // OMPBuilder.emitOffloadingArraysArgument(CGF.Builder, Info.RTArgs, Info,
+  // false); EmitDebug,
+  // /*ForEndCall=*/false);
+  llvm::OpenMPIRBuilder::InsertPointTy OffloadingArraysAllocaIP(
+      CGF.AllocaInsertPt->getParent(), CGF.AllocaInsertPt->getIterator());
+
+  OMPBuilder.emitOffloadingArraysAndArgs(
+      OffloadingArraysAllocaIP, CGF.Builder.saveIP(), Info, Info.RTArgs,
+      GenMapInfoCB, /*IsNonContiguous=*/true, /*ForEndCall=*/false,
       DeviceAddrCB, CustomMapperCB);
-
-  LLVM_DEBUG(llvm::dbgs() << "Info.RTArgs.BasePointerArray after "
-                             "OMPBuilder.emitOffloadingArrays()\n");
-  if (Info.RTArgs.BasePointersArray) {
-    LLVM_DEBUG(llvm::dbgs() << "Info.RTArgs.BasePointersArray = "
-                            << *Info.RTArgs.BasePointersArray << "\n");
-  } else {
-    LLVM_DEBUG(llvm::dbgs() << "Info.RTArgs.BasePointersArray is nullptr\n");
-  }
-  bool EmitDebug = !CombinedInfo.Names.empty();
-  OMPBuilder.emitOffloadingArraysArgument(CGF.Builder, Info.RTArgs, Info,
-                                          EmitDebug,
-                                          /*ForEndCall=*/false);
-  LLVM_DEBUG(llvm::dbgs() << "Info.RTARgs.BasePointerArray after "
-                             "OMPBuilder.emitOffloadingArraysArgument()\n");
-  if (Info.RTArgs.BasePointersArray) {
-    LLVM_DEBUG(llvm::dbgs() << "Info.RTArgs.BasePointersArray = "
-                            << *Info.RTArgs.BasePointersArray << "\n");
-  } else {
-    LLVM_DEBUG(llvm::dbgs() << "Info.RTArgs.BasePointersArray is nullptr\n");
-  }
-
   LLVM_DEBUG(llvm::dbgs() << "emitTargetCallKernelLaunchNew:InsertBlock after "
                              "emitting offload arrays: "
                           << *CGF.Builder.GetInsertBlock() << "\n");
@@ -9820,10 +9807,9 @@ static void emitTargetCallKernelLaunch(
   LLVM_DEBUG(llvm::dbgs() << "InsertBlock before emitting offload arrays: "
                           << *CGF.Builder.GetInsertBlock() << "\n");
   emitOffloadingArrays(CGF, CombinedInfo, Info, OMPBuilder);
-  bool EmitDebug = CGF.CGM.getCodeGenOpts().getDebugInfo() !=
+  Info.EmitDebug = CGF.CGM.getCodeGenOpts().getDebugInfo() !=
                    llvm::codegenoptions::NoDebugInfo;
   OMPBuilder.emitOffloadingArraysArgument(CGF.Builder, Info.RTArgs, Info,
-                                          EmitDebug,
                                           /*ForEndCall=*/false);
 
   LLVM_DEBUG(llvm::dbgs() << "InsertBlock after emitting offload arrays: "
@@ -10744,10 +10730,9 @@ void CGOpenMPRuntime::emitTargetDataStandAloneCall(
                          /*IsNonContiguous=*/true);
     bool RequiresOuterTask = D.hasClausesOfKind<OMPDependClause>() ||
                              D.hasClausesOfKind<OMPNowaitClause>();
-    bool EmitDebug = CGF.CGM.getCodeGenOpts().getDebugInfo() !=
+    Info.EmitDebug = CGF.CGM.getCodeGenOpts().getDebugInfo() !=
                      llvm::codegenoptions::NoDebugInfo;
     OMPBuilder.emitOffloadingArraysArgument(CGF.Builder, Info.RTArgs, Info,
-                                            EmitDebug,
                                             /*ForEndCall=*/false);
     InputInfo.NumberOfTargetItems = Info.NumberOfPtrs;
     InputInfo.BasePointersArray = Address(Info.RTArgs.BasePointersArray,

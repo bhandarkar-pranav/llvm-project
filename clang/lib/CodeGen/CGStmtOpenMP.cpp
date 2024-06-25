@@ -5063,6 +5063,18 @@ void CodeGenFunction::NewEmitOMPTargetTaskBasedDirective(
     OMPTargetDataInfo &InputInfo) {
   EmitOMPTargetTaskBasedDirective(S, BodyGen, InputInfo);
 }
+void CodeGenFunction::printLocalDeclMap() {
+  using llvm::dbgs;
+  dbgs() << "***LocalDeclMap****\n";
+  for (auto &m : LocalDeclMap) {
+    const Decl *D = m.first;
+    Address A = m.second;
+    const llvm::Value *RawAddress = A.emitRawPointer(*this);
+    D->dump();
+    dbgs() << " :-> " << *RawAddress << "\n";
+  }
+  dbgs() << "****DONE LocalDeclMap***\n";
+}
 void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
     const OMPExecutableDirective &S, const RegionCodeGenTy &BodyGen,
     OMPTargetDataInfo &InputInfo) {
@@ -5073,6 +5085,9 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
   LLVM_DEBUG(CS->dump());
   Address CapturedStruct = GenerateCapturedStmtArgument(*CS);
   QualType SharedsTy = getContext().getRecordType(CS->getCapturedRecordDecl());
+  LLVM_DEBUG(
+      llvm::dbgs() << "(EmitOMPTargetTaskBasedDirective): CapturedDecl is \n");
+  LLVM_DEBUG(CS->getCapturedDecl()->dump());
   auto I = CS->getCapturedDecl()->param_begin();
   auto PartId = std::next(I);
   auto TaskT = std::next(I, 4);
@@ -5154,8 +5169,13 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
       TargetScope.addPrivate(MVD, InputInfo.MappersArray);
     }
   }
+  LLVM_DEBUG(llvm::dbgs() << "LocalDeclMap BEFORE TargetScope.Privatize\n");
+  LLVM_DEBUG(printLocalDeclMap());
   (void)TargetScope.Privatize();
+  LLVM_DEBUG(llvm::dbgs() << "LocalDeclMap AFTER TargetScope.Privatize\n");
+  LLVM_DEBUG(printLocalDeclMap());
   buildDependences(S, Data);
+  LLVM_DEBUG(Data.printTo(llvm::dbgs(), getContext()));
   auto &&CodeGen = [&Data, &S, CS, &BodyGen, BPVD, PVD, SVD, MVD,
                     &InputInfo](CodeGenFunction &CGF, PrePostActionTy &Action) {
     // Set proper addresses for generated private copies.
@@ -5220,6 +5240,8 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
     }
     BodyGen(CGF);
   };
+  LLVM_DEBUG(llvm::dbgs() << "Inputs to emitTaskOutineFunction\n");
+  LLVM_DEBUG(llvm::dbgs() << "PartID = " << **PartId << "\n");
   llvm::Function *OutlinedFn = CGM.getOpenMPRuntime().emitTaskOutlinedFunction(
       S, *I, *PartId, *TaskT, S.getDirectiveKind(), CodeGen, /*Tied=*/true,
       Data.NumberOfParts);
