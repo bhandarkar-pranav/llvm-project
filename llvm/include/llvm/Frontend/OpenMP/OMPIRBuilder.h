@@ -2302,6 +2302,21 @@ public:
     }
   };
 
+  // llvm::Function *
+  // emitProxyTaskFunction(CodeGenModule &CGM, SourceLocation Loc,
+  //                       OpenMPDirectiveKind Kind, QualType KmpInt32Ty,
+  //                       QualType KmpTaskTWithPrivatesPtrQTy,
+  //                       QualType KmpTaskTWithPrivatesQTy, QualType
+  //                       KmpTaskTQTy, QualType SharedsPtrTy, llvm::Function
+  //                       *TaskFunction, llvm::Value *TaskPrivatesMap) {
+  using FunctionAttrsCallBackTy = function_ref<void(llvm::Function *)>;
+
+  llvm::Function *emitProxyTaskFunction(
+      llvm::Type *KmpInt32Ty, llvm::Type *KmpTaskTWithPrivatesPtrTy,
+      llvm::Type *KmpTaskTWithPrivatesTy, llvm::Type *KmpTaskTy,
+      llvm::Type *SharedsPtrTy, llvm::Function *TaskFunction,
+      llvm::Value *TaskPrivatesMap, unsigned PrivatesFieldNo,
+      FunctionAttrsCallBackTy FunctionAttrsCB = nullptr);
   /// Callback function type for functions emitting the host fallback code that
   /// is executed when the kernel launch fails. It takes an insertion point as
   /// parameter where the code should be emitted. It returns an insertion point

@@ -37,6 +37,9 @@
 #include "llvm/Support/AtomicOrdering.h"
 #include "llvm/Support/Debug.h"
 #include <optional>
+
+#define DEBUG_TYPE "clang-openmp-codegen"
+
 using namespace clang;
 using namespace CodeGen;
 using namespace llvm::omp;
@@ -5272,6 +5275,8 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
                         SourceLocation());
   CGM.getOpenMPRuntime().emitTaskCall(*this, S.getBeginLoc(), S, OutlinedFn,
                                       SharedsTy, CapturedStruct, &IfCond, Data);
+  LLVM_DEBUG(llvm::dbgs() << "Module after EmitOMPTargetTaskBasedDirective is "
+                          << *OutlinedFn->getParent());
 }
 
 void CodeGenFunction::processInReduction(const OMPExecutableDirective &S,
