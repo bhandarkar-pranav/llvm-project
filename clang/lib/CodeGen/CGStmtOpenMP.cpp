@@ -5254,6 +5254,8 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
                         SourceLocation());
   CGM.getOpenMPRuntime().emitTaskCall(*this, S.getBeginLoc(), S, OutlinedFn,
                                       SharedsTy, CapturedStruct, &IfCond, Data);
+  LLVM_DEBUG(llvm::dbgs() << "Module after EmitOMPTargetTaskBasedDirective is "
+                          << *OutlinedFn->getParent());
 }
 
 void CodeGenFunction::processInReduction(const OMPExecutableDirective &S,

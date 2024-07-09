@@ -5282,6 +5282,108 @@ static Function *createOutlinedFunction(
 
   return Func;
 }
+llvm::Function *OpenMPIRBuilder::emitProxyTaskFunction(
+    llvm::Type *KmpInt32Ty, llvm::Type *KmpTaskTWithPrivatesPtrTy,
+    llvm::Type *KmpTaskTWithPrivatesTy, llvm::Type *KmpTaskTy,
+    llvm::Type *SharedsPtrTy, llvm::Function *TaskFunction,
+    llvm::Value *TaskPrivatesMap, unsigned PrivatesFieldNo,
+    FunctionAttrsCallBackTy FunctionAttrsCB) {
+
+  // llvm::errs() << "********************************************\n";
+  // llvm::errs() << "Types inside OMPBuilder.emitProxyTaskFunction\n";
+  // llvm::errs() << "KmpInt32Ty = " << *KmpInt32Ty << "\n";
+  // llvm::errs() << "KmpTaskTWithPrivatesPtrTy = " <<
+  // *KmpTaskTWithPrivatesPtrTy
+  //              << "\n";
+  // llvm::errs() << "KmpTaskTWithPrivatesTy = " << *KmpTaskTWithPrivatesTy
+  //              << "\n";
+  // llvm::errs() << "SharedsPtrTy = " << *SharedsPtrTy << "\n";
+  // llvm::errs() << "TaskPrivatesMap = " << *TaskPrivatesMap << "\n";
+  auto *KmpTaskTWithPrivatesStTy = dyn_cast<StructType>(KmpTaskTWithPrivatesTy);
+  assert(KmpTaskTWithPrivatesStTy &&
+         "KmpTaskTWithPrivatesStTy is not a struct. Shouldn't it be?");
+  LLVMContext &Ctx = Builder.getContext();
+  llvm::errs() << "KmpTaskTWithPrivatesStTy is a struct\n";
+  llvm::errs() << "NumElements = " << KmpTaskTWithPrivatesStTy->getNumElements()
+               << "\n";
+  auto NumElements = KmpTaskTWithPrivatesStTy->getNumElements();
+  // KmpTaskTWithPrivatesStTy should be either
+  // 1. {struct task_t}, OR
+  // 2. {struct task_t, struct privates}
+  // assert(NumElements <= 2 &&
+  //        "KmpTaskTWithPrivatesStTy should have atmost two elements");
+  auto HasPrivates = PrivatesFieldNo != 0;
+
+  // for (unsigned i = 0; i < KmpTaskTWithPrivatesStTy->getNumElements(); ++i) {
+  //   auto *Ty = KmpTaskTWithPrivatesStTy->getElementType(i);
+  //   llvm::errs() << "Type of element " << i << " is " << *Ty << "\n";
+  // }
+  // llvm::errs() << "TaskFunction type is " << *TaskFunction->getFunctionType()
+  //              << "\n";
+  // llvm::errs() << "********************************************\n";
+
+  // ********************* Do the builder work here *****
+  InsertPointTy OldIP(Builder.saveIP());
+  auto ProxyFnTy =
+      FunctionType::get(KmpInt32Ty, {KmpInt32Ty, KmpTaskTWithPrivatesPtrTy},
+                        /* isVarArg */ false);
+  auto ProxyFn = Function::Create(ProxyFnTy, GlobalValue::InternalLinkage,
+                                  ".omp_task_entry.", M);
+
+  if (FunctionAttrsCB)
+    FunctionAttrsCB(ProxyFn);
+  // llvm::errs() << "ProxyFnTy is " << *ProxyFnTy << "\n";
+  ProxyFn->addParamAttr(0, Attribute::NoUndef);
+  ProxyFn->addParamAttr(1, Attribute::NoUndef);
+  ProxyFn->addParamAttr(1, Attribute::NoAlias);
+  // ProxyFn->getArg(0)->setName("thread.id");
+  // ProxyFn->getArg(1)->setName("task");
+  Value *ThreadIDParam = ProxyFn->getArg(0);
+  Value *TaskTWithPrivatesParam = ProxyFn->getArg(1);
+  BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", ProxyFn);
+  Builder.SetInsertPoint(EntryBB);
+  Value *TaskTElement = Builder.CreateStructGEP(KmpTaskTWithPrivatesStTy,
+                                                TaskTWithPrivatesParam, 0);
+  Value *PartID = Builder.CreateStructGEP(
+      KmpTaskTWithPrivatesStTy->getElementType(0), TaskTElement, 2);
+  Value *Privates = nullptr;
+  if (HasPrivates)
+    Privates = Builder.CreateStructGEP(KmpTaskTWithPrivatesStTy,
+                                       TaskTWithPrivatesParam, PrivatesFieldNo);
+  else {
+    PointerType *PtrTy = Builder.getPtrTy();
+    Privates = ConstantPointerNull::get(PtrTy);
+  }
+  Value *Shareds = Builder.CreateStructGEP(
+      KmpTaskTWithPrivatesStTy->getElementType(0), TaskTElement, 0);
+  LoadInst *LoadShared =
+      Builder.CreateLoad(PointerType::getUnqual(Ctx), Shareds);
+  llvm::errs() << "TaskTElement->getType() = " << TaskTElement->getType()
+               << " = " << *TaskTElement->getType() << "\n";
+  llvm::errs() << "Type:OMPBuilder.Task = " << this->Task << " = "
+               << *this->Task << "\n";
+  // Task coming in from Clang codegen has the following type.
+  // %struct.kmp_task_t = type { ptr, ptr, i32, %union.kmp_cmplrdata_t,
+  // %union.kmp_cmplrdata_t } %union.kmp_cmplrdata_t = type { ptr } Whereas,
+  // OpenMPIRBuilder::Task is %struct.kmp_task_ompbuilder_t = type {
+  // ptr%struct.kmp_task_ompbuilder_t = type { ptr, ptr, i32, ptr, ptr }, ptr,
+  // i32, ptr, ptr }
+  auto Call = Builder.CreateCall(
+      TaskFunction, {ThreadIDParam, PartID, Privates, TaskPrivatesMap,
+                     TaskTWithPrivatesParam, LoadShared});
+  if (TaskFunction->doesNotThrow()) {
+    Call->setDoesNotThrow();
+  }
+  // ;  call void @.omp_outlined..1(i32 %2 /*thread_id*/, /*part_id*/ ptr %5,
+  // /*privates*/ ptr %8, ptr @.omp_task_privates_map..2, ptr %3, ptr /*pointer
+  // to shareds*/%7) #4
+  Builder.CreateRet(ConstantInt::get(KmpInt32Ty, 0));
+  Builder.restoreIP(OldIP);
+  ProxyFn->addFnAttr("min-legal-vector-width", llvm::utostr(0U));
+
+  // ********************* End builder work here *******
+  return ProxyFn;
+}
 
 /// Create an entry point for a target task with the following.
 /// It'll have the following signature

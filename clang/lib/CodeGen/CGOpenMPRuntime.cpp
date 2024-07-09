@@ -3013,7 +3013,7 @@ emitProxyTaskFunction(CodeGenModule &CGM, SourceLocation Loc,
   LLVM_DEBUG(llvm::dbgs() << "TaskEntryTy=" << *TaskEntryTy << "\n");
   LLVM_DEBUG(llvm::dbgs() << "KmpTaskTWithPrivatesPtrQTy = "
                           << KmpTaskTWithPrivatesPtrQTy << "\n");
-  LLVM_DEBUG(llvm::dbgs() << "TaskTypeArg = " << TaskTypeArg << "\n");
+  // LLVM_DEBUG(llvm::dbgs() << "TaskTypeArg = " << TaskTypeArg << "\n");
   std::string Name = CGM.getOpenMPRuntime().getName({"omp_task_entry", ""});
   auto *TaskEntry = llvm::Function::Create(
       TaskEntryTy, llvm::GlobalValue::InternalLinkage, Name, &CGM.getModule());
@@ -3708,17 +3708,72 @@ CGOpenMPRuntime::emitTaskInit(CodeGenFunction &CGF, SourceLocation Loc,
     TaskPrivatesMap = CGF.Builder.CreatePointerBitCastOrAddrSpaceCast(
         TaskPrivatesMap, TaskPrivatesMapTy);
   } else {
+    LLVM_DEBUG(llvm::dbgs()
+               << "TaskPrivatesMapTy = " << *TaskPrivatesMapTy << "\n");
     TaskPrivatesMap = llvm::ConstantPointerNull::get(
         cast<llvm::PointerType>(TaskPrivatesMapTy));
   }
+  LLVM_DEBUG(llvm::dbgs() << "KmpTaskTWithPrivatesTy = "
+                          << *KmpTaskTWithPrivatesTy << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "KmpTaskTWithPrivatesQTy = ");
+  LLVM_DEBUG(KmpTaskTWithPrivatesQTy.dump());
+  LLVM_DEBUG(llvm::dbgs() << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "KmpTaskTQTyRD = " << *KmpTaskTQTyRD << "\n");
   // Build a proxy function kmp_int32 .omp_task_entry.(kmp_int32 gtid,
   // kmp_task_t *tt);
-  llvm::Function *TaskEntry = emitProxyTaskFunction(
-      CGM, Loc, D.getDirectiveKind(), KmpInt32Ty, KmpTaskTWithPrivatesPtrQTy,
-      KmpTaskTWithPrivatesQTy, KmpTaskTQTy, SharedsPtrTy, TaskFunction,
-      TaskPrivatesMap);
+  auto FunctionAttrsCB = [&](llvm::Function *TaskEntryFunc) {
+    ASTContext &C = CGM.getContext();
+    FunctionArgList Args;
+    ImplicitParamDecl GtidArg(C, /*DC=*/nullptr, Loc, /*Id=*/nullptr,
+                              KmpInt32Ty, ImplicitParamKind::Other);
+    ImplicitParamDecl TaskTypeArg(C, /*DC=*/nullptr, Loc, /*Id=*/nullptr,
+                                  KmpTaskTWithPrivatesPtrQTy.withRestrict(),
+                                  ImplicitParamKind::Other);
+    Args.push_back(&GtidArg);
+    Args.push_back(&TaskTypeArg);
+    const auto &TaskEntryFnInfo =
+        CGM.getTypes().arrangeBuiltinFunctionDeclaration(KmpInt32Ty, Args);
+    llvm::FunctionType *TaskEntryTy =
+        CGM.getTypes().GetFunctionType(TaskEntryFnInfo);
+    assert(TaskEntryTy == TaskEntryFunc->getFunctionType());
+    std::string Name = CGM.getOpenMPRuntime().getName({"omp_task_entry", ""});
+    // auto *TaskEntryFunc =
+    //     llvm::Function::Create(TaskEntryTy,
+    //     llvm::GlobalValue::InternalLinkage,
+    //                            Name, &CGM.getModule());
+    CGM.SetInternalFunctionAttributes(GlobalDecl(), TaskEntryFunc,
+                                      TaskEntryFnInfo);
+    TaskEntryFunc->setDoesNotRecurse();
+  };
+  llvm::Function *TaskEntry = [&]() {
+    if (isOpenMPTaskLoopDirective(D.getDirectiveKind()))
+      return emitProxyTaskFunction(CGM, Loc, D.getDirectiveKind(), KmpInt32Ty,
+                                   KmpTaskTWithPrivatesPtrQTy,
+                                   KmpTaskTWithPrivatesQTy, KmpTaskTQTy,
+                                   SharedsPtrTy, TaskFunction, TaskPrivatesMap);
 
-  LLVM_DEBUG(llvm::dbgs() << "ProxyTaskFunction is " << *TaskEntry);
+    const auto *KmpTaskTWithPrivatesQTyRD =
+        cast<RecordDecl>(KmpTaskTWithPrivatesQTy->getAsTagDecl());
+    auto PrivatesFI = std::next(KmpTaskTWithPrivatesQTyRD->field_begin(), 1);
+    unsigned PrivatesFieldNo = 0;
+    if (PrivatesFI != KmpTaskTWithPrivatesQTyRD->field_end()) {
+      const CGRecordLayout &RL =
+          CGF.getTypes().getCGRecordLayout(KmpTaskTWithPrivatesQTyRD);
+      const FieldDecl *FD = *PrivatesFI;
+      PrivatesFieldNo = RL.getLLVMFieldNo(FD);
+    }
+
+    LLVM_DEBUG(llvm::dbgs() << "PrivatesFieldNo = " << PrivatesFieldNo << "\n");
+    return OMPBuilder.emitProxyTaskFunction(
+        CGF.ConvertType(KmpInt32Ty), KmpTaskTWithPrivatesPtrTy,
+        KmpTaskTWithPrivatesTy, CGF.ConvertType(KmpTaskTQTy),
+        CGF.ConvertType(SharedsTy)->getPointerTo(), TaskFunction,
+        TaskPrivatesMap, PrivatesFieldNo, FunctionAttrsCB);
+  }();
+
+  LLVM_DEBUG(llvm::dbgs() << "ProxyTaskFunction is \n" << *TaskEntry);
+  //  LLVM_DEBUG(llvm::dbgs() << "MOdule after ProxyTaskFunction is \n" <<
+  //  *TaskEntry->getParent());
   // Build call kmp_task_t * __kmpc_omp_task_alloc(ident_t *, kmp_int32 gtid,
   // kmp_int32 flags, size_t sizeof_kmp_task_t, size_t sizeof_shareds,
   // kmp_routine_entry_t *task_entry);
@@ -4632,6 +4687,9 @@ void CGOpenMPRuntime::emitTaskCall(CodeGenFunction &CGF, SourceLocation Loc,
     RegionCodeGenTy ThenRCG(ThenCodeGen);
     ThenRCG(CGF);
   }
+
+  LLVM_DEBUG(llvm::dbgs() << "Module after emitTaskCall\n "
+                          << *TaskFunction->getParent() << "\n");
 }
 
 void CGOpenMPRuntime::emitTaskLoopCall(CodeGenFunction &CGF, SourceLocation Loc,
