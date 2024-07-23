@@ -3753,13 +3753,16 @@ CGOpenMPRuntime::emitTaskInit(CodeGenFunction &CGF, SourceLocation Loc,
       const FieldDecl *FD = *PrivatesFI;
       PrivatesFieldNo = RL.getLLVMFieldNo(FD);
     }
+    CharUnits KmpTaskTWithPrivatesQTyAlignment =
+        CGM.getNaturalTypeAlignment(KmpTaskTWithPrivatesQTy);
 
     LLVM_DEBUG(llvm::dbgs() << "PrivatesFieldNo = " << PrivatesFieldNo << "\n");
     return OMPBuilder.emitProxyTaskFunction(
         CGF.ConvertType(KmpInt32Ty), KmpTaskTWithPrivatesPtrTy,
         KmpTaskTWithPrivatesTy, CGF.ConvertType(KmpTaskTQTy),
         CGF.ConvertType(SharedsTy)->getPointerTo(), TaskFunction,
-        TaskPrivatesMap, PrivatesFieldNo, FunctionAttrsCB);
+        TaskPrivatesMap, PrivatesFieldNo,
+        KmpTaskTWithPrivatesQTyAlignment.getAsMaybeAlign(), FunctionAttrsCB);
   }();
 
   LLVM_DEBUG(llvm::dbgs() << "ProxyTaskFunction is \n" << *TaskEntry);
