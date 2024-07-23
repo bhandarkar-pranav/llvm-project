@@ -1761,6 +1761,7 @@ public:
       llvm::Type *KmpTaskTWithPrivatesTy, llvm::Type *KmpTaskTy,
       llvm::Type *SharedsPtrTy, llvm::Function *TaskFunction,
       llvm::Value *TaskPrivatesMap, unsigned PrivatesFieldNo,
+      llvm::MaybeAlign KmpTaskTWithPrivatesTyAlignment,
       FunctionAttrsCallBackTy FunctionAttrsCB = nullptr);
   /// Callback function type for functions emitting the host fallback code that
   /// is executed when the kernel launch fails. It takes an insertion point as

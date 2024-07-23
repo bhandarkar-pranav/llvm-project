@@ -5287,6 +5287,7 @@ llvm::Function *OpenMPIRBuilder::emitProxyTaskFunction(
     llvm::Type *KmpTaskTWithPrivatesTy, llvm::Type *KmpTaskTy,
     llvm::Type *SharedsPtrTy, llvm::Function *TaskFunction,
     llvm::Value *TaskPrivatesMap, unsigned PrivatesFieldNo,
+    llvm::MaybeAlign KmpTaskTWithPrivatesTyAlignment,
     FunctionAttrsCallBackTy FunctionAttrsCB) {
 
   // llvm::errs() << "********************************************\n";
@@ -5333,8 +5334,8 @@ llvm::Function *OpenMPIRBuilder::emitProxyTaskFunction(
   if (FunctionAttrsCB)
     FunctionAttrsCB(ProxyFn);
   // llvm::errs() << "ProxyFnTy is " << *ProxyFnTy << "\n";
-  ProxyFn->addParamAttr(0, Attribute::NoUndef);
-  ProxyFn->addParamAttr(1, Attribute::NoUndef);
+  // ProxyFn->addParamAttr(0, Attribute::NoUndef);
+  // ProxyFn->addParamAttr(1, Attribute::NoUndef);
   ProxyFn->addParamAttr(1, Attribute::NoAlias);
   // ProxyFn->getArg(0)->setName("thread.id");
   // ProxyFn->getArg(1)->setName("task");
@@ -5342,10 +5343,30 @@ llvm::Function *OpenMPIRBuilder::emitProxyTaskFunction(
   Value *TaskTWithPrivatesParam = ProxyFn->getArg(1);
   BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", ProxyFn);
   Builder.SetInsertPoint(EntryBB);
+
+  // *****PDB:: Potentially remove these allocas and load stores later.
+  // For now, so that the lit tests do not impede progress on solving
+  // the larger problem, keep these allocas to keep the lit tests happy
+  auto *TIDAlloca = Builder.CreateAlloca(KmpInt32Ty, nullptr, ".addr");
+  auto *TaskTAlloca =
+      Builder.CreateAlloca(KmpTaskTWithPrivatesPtrTy, nullptr, ".addr");
+
+  Builder.CreateStore(ThreadIDParam, TIDAlloca);
+  Builder.CreateStore(TaskTWithPrivatesParam, TaskTAlloca);
+
+  ThreadIDParam = Builder.CreateLoad(KmpInt32Ty, TIDAlloca);
+  TaskTWithPrivatesParam =
+      Builder.CreateLoad(KmpTaskTWithPrivatesPtrTy, TaskTAlloca);
+
   Value *TaskTElement = Builder.CreateStructGEP(KmpTaskTWithPrivatesStTy,
                                                 TaskTWithPrivatesParam, 0);
   Value *PartID = Builder.CreateStructGEP(
       KmpTaskTWithPrivatesStTy->getElementType(0), TaskTElement, 2);
+  Value *Shareds = Builder.CreateStructGEP(
+      KmpTaskTWithPrivatesStTy->getElementType(0), TaskTElement, 0);
+  LoadInst *LoadShared = Builder.CreateAlignedLoad(
+      PointerType::getUnqual(Ctx), Shareds, KmpTaskTWithPrivatesTyAlignment);
+
   Value *Privates = nullptr;
   if (HasPrivates)
     Privates = Builder.CreateStructGEP(KmpTaskTWithPrivatesStTy,
@@ -5354,10 +5375,6 @@ llvm::Function *OpenMPIRBuilder::emitProxyTaskFunction(
     PointerType *PtrTy = Builder.getPtrTy();
     Privates = ConstantPointerNull::get(PtrTy);
   }
-  Value *Shareds = Builder.CreateStructGEP(
-      KmpTaskTWithPrivatesStTy->getElementType(0), TaskTElement, 0);
-  LoadInst *LoadShared =
-      Builder.CreateLoad(PointerType::getUnqual(Ctx), Shareds);
   llvm::errs() << "TaskTElement->getType() = " << TaskTElement->getType()
                << " = " << *TaskTElement->getType() << "\n";
   llvm::errs() << "Type:OMPBuilder.Task = " << this->Task << " = "
