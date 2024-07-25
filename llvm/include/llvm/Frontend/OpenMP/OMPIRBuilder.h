@@ -2310,12 +2310,13 @@ public:
   //                       KmpTaskTQTy, QualType SharedsPtrTy, llvm::Function
   //                       *TaskFunction, llvm::Value *TaskPrivatesMap) {
   using FunctionAttrsCallBackTy = function_ref<void(llvm::Function *)>;
+  using PrivatesIndexTy = std::pair<llvm::Type *, unsigned>;
 
   llvm::Function *emitProxyTaskFunction(
       llvm::Type *KmpInt32Ty, llvm::Type *KmpTaskTWithPrivatesPtrTy,
       llvm::Type *KmpTaskTWithPrivatesTy, llvm::Type *KmpTaskTy,
       llvm::Type *SharedsPtrTy, llvm::Function *TaskFunction,
-      llvm::Value *TaskPrivatesMap, unsigned PrivatesFieldNo,
+      llvm::Value *TaskPrivatesMap, PrivatesIndexTy PrivatesIndex,
       llvm::MaybeAlign KmpTaskTWithPrivatesTyAlignment,
       FunctionAttrsCallBackTy FunctionAttrsCB = nullptr);
   /// Callback function type for functions emitting the host fallback code that

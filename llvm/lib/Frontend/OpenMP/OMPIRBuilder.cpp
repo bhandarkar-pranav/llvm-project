@@ -6689,7 +6689,7 @@ llvm::Function *OpenMPIRBuilder::emitProxyTaskFunction(
     llvm::Type *KmpInt32Ty, llvm::Type *KmpTaskTWithPrivatesPtrTy,
     llvm::Type *KmpTaskTWithPrivatesTy, llvm::Type *KmpTaskTy,
     llvm::Type *SharedsPtrTy, llvm::Function *TaskFunction,
-    llvm::Value *TaskPrivatesMap, unsigned PrivatesFieldNo,
+    llvm::Value *TaskPrivatesMap, PrivatesIndexTy PrivatesIndex,
     llvm::MaybeAlign KmpTaskTWithPrivatesTyAlignment,
     FunctionAttrsCallBackTy FunctionAttrsCB) {
 
@@ -6716,7 +6716,18 @@ llvm::Function *OpenMPIRBuilder::emitProxyTaskFunction(
   // 2. {struct task_t, struct privates}
   // assert(NumElements <= 2 &&
   //        "KmpTaskTWithPrivatesStTy should have atmost two elements");
-  auto HasPrivates = PrivatesFieldNo != 0;
+
+  // KmpTaskTWithPrivatesTy is a structure whose first member is kmp_task_t.
+  // The other member, if present is kmp_privates_t. But it may not necessarily
+  // be the second member because depending on alignment requirements of
+  // the privates, there may be padding in KmpTaskTWithPrivatesTy between
+  // kmp_task_t and kmp_privates_t. So, that's why we need clang to tell us
+  // the index of the privates inside the structure. The other piece of
+  // information needed is the type of the base for which PrivatesIndexNo
+  // makes sense.
+  auto PrivatesBaseTy = PrivatesIndex.first;
+  auto PrivatesIndexNo = PrivatesIndex.second;
+  auto HasPrivates = PrivatesIndexNo != 0;
 
   // for (unsigned i = 0; i < KmpTaskTWithPrivatesStTy->getNumElements(); ++i) {
   //   auto *Ty = KmpTaskTWithPrivatesStTy->getElementType(i);
@@ -6771,10 +6782,18 @@ llvm::Function *OpenMPIRBuilder::emitProxyTaskFunction(
       PointerType::getUnqual(Ctx), Shareds, KmpTaskTWithPrivatesTyAlignment);
 
   Value *Privates = nullptr;
-  if (HasPrivates)
-    Privates = Builder.CreateStructGEP(KmpTaskTWithPrivatesStTy,
-                                       TaskTWithPrivatesParam, PrivatesFieldNo);
-  else {
+  if (HasPrivates) {
+    if (isa<StructType>(PrivatesBaseTy)) {
+      Privates =
+          Builder.CreateStructGEP(dyn_cast<StructType>(PrivatesBaseTy),
+                                  TaskTWithPrivatesParam, PrivatesIndexNo);
+    } else {
+      assert(PrivatesBaseTy->isIntOrIntVectorTy() &&
+             PrivatesBaseTy->getIntegerBitWidth() == 8);
+      Privates = Builder.CreateConstInBoundsGEP1_64(
+          PrivatesBaseTy, TaskTWithPrivatesParam, PrivatesIndexNo);
+    }
+  } else {
     PointerType *PtrTy = Builder.getPtrTy();
     Privates = ConstantPointerNull::get(PtrTy);
   }

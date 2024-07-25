@@ -3747,11 +3747,17 @@ CGOpenMPRuntime::emitTaskInit(CodeGenFunction &CGF, SourceLocation Loc,
         cast<RecordDecl>(KmpTaskTWithPrivatesQTy->getAsTagDecl());
     auto PrivatesFI = std::next(KmpTaskTWithPrivatesQTyRD->field_begin(), 1);
     unsigned PrivatesFieldNo = 0;
+    llvm::Type *PrivatesBaseTy = KmpTaskTWithPrivatesTy;
     if (PrivatesFI != KmpTaskTWithPrivatesQTyRD->field_end()) {
       const CGRecordLayout &RL =
           CGF.getTypes().getCGRecordLayout(KmpTaskTWithPrivatesQTyRD);
       const FieldDecl *FD = *PrivatesFI;
-      PrivatesFieldNo = RL.getLLVMFieldNo(FD);
+      if (isEmptyFieldForLayout(CGF.getContext(), FD)) {
+        unsigned CharWidth = CGF.getContext().getCharWidth();
+        PrivatesBaseTy = CGF.Int8Ty;
+        PrivatesFieldNo = CGF.getContext().getFieldOffset(FD) / CharWidth;
+      } else
+        PrivatesFieldNo = RL.getLLVMFieldNo(FD);
     }
     CharUnits KmpTaskTWithPrivatesQTyAlignment =
         CGM.getNaturalTypeAlignment(KmpTaskTWithPrivatesQTy);
@@ -3761,7 +3767,7 @@ CGOpenMPRuntime::emitTaskInit(CodeGenFunction &CGF, SourceLocation Loc,
         CGF.ConvertType(KmpInt32Ty), KmpTaskTWithPrivatesPtrTy,
         KmpTaskTWithPrivatesTy, CGF.ConvertType(KmpTaskTQTy),
         CGF.ConvertType(SharedsTy)->getPointerTo(), TaskFunction,
-        TaskPrivatesMap, PrivatesFieldNo,
+        TaskPrivatesMap, std::make_pair(PrivatesBaseTy, PrivatesFieldNo),
         KmpTaskTWithPrivatesQTyAlignment.getAsMaybeAlign(), FunctionAttrsCB);
   }();
 
