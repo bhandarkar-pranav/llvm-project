@@ -6108,11 +6108,6 @@ const Expr *CGOpenMPRuntime::getNumTeamsExprForTargetDirective(
         MinTeamsVal = MaxTeamsVal = 0;
         return nullptr;
       }
-      if (isOpenMPParallelDirective(NestedDir->getDirectiveKind()) ||
-          isOpenMPSimdDirective(NestedDir->getDirectiveKind())) {
-        MinTeamsVal = MaxTeamsVal = 1;
-        return nullptr;
-      }
       MinTeamsVal = MaxTeamsVal = 1;
       return nullptr;
     }
