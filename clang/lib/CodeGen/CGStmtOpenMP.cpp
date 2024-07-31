@@ -42,7 +42,7 @@ using namespace CodeGen;
 using namespace llvm::omp;
 
 #define TTL_CODEGEN_TYPE "target-teams-loop-codegen"
-
+#define DEBUG_TYPE "clang-openmp-codegen"
 static const VarDecl *getBaseDecl(const Expr *Ref);
 static OpenMPDirectiveKind
 getEffectiveDirectiveKind(const OMPExecutableDirective &S);
@@ -310,7 +310,55 @@ public:
 };
 
 } // namespace
+namespace clang {
+namespace CodeGen {
+raw_ostream &operator<<(raw_ostream &OS, const OMPTaskDataTy &Data) {
 
+  // auto &&PrintVector = [&OS](std::string Name, const SmallVector<const Expr *, 4> &V) {
+  //   OS << "PrivateVars = {\n";
+  //   for (auto &PV : V) {
+  //     OS << PV << "\n";
+  //   }
+  //   OS << "}\n";
+  // };
+  auto &&Start = [&OS](std::string Name) {
+    OS << Name << " = {\n";
+  };
+  auto &&End = [&OS]() {
+    OS << "}\n";
+  };
+
+  Start("PrivateVars");
+  for (auto &E : Data.PrivateVars) {
+    E->dump();
+  }
+  End();
+  Start("PrivateCopies");
+  for (auto &E : Data.PrivateCopies) {
+    E->dump();
+  }
+  End();
+
+  Start("FirstprivateVars");
+  for (auto &E : Data.FirstprivateVars) {
+    E->dump();
+  }
+  End();
+  Start("FirstprivateCopies");
+  for (auto &E : Data.FirstprivateCopies) {
+    E->dump();
+  }
+  End();
+  Start("FirstprivateInits");
+  for (auto &E : Data.FirstprivateInits) {
+    E->dump();
+  }
+  End();
+  
+  return OS;
+}
+} // namespace CodeGen
+} // namespace clang
 // The loop directive with a bind clause will be mapped to a different
 // directive with corresponding semantics.
 static OpenMPDirectiveKind
@@ -5087,6 +5135,7 @@ void CodeGenFunction::EmitOMPTaskBasedDirective(
     Action.Enter(CGF);
     BodyGen(CGF);
   };
+  LLVM_DEBUG(llvm::dbgs() << Data << "\n");
   OpenMPDirectiveKind EKind = getEffectiveDirectiveKind(S);
   llvm::Function *OutlinedFn = CGM.getOpenMPRuntime().emitTaskOutlinedFunction(
       S, *I, *PartId, *TaskT, EKind, CodeGen, Data.Tied, Data.NumberOfParts);
@@ -5123,6 +5172,7 @@ createImplicitFirstprivateForType(ASTContext &C, OMPTaskDataTy &Data,
   Data.FirstprivateVars.emplace_back(OrigRef);
   Data.FirstprivateCopies.emplace_back(PrivateRef);
   Data.FirstprivateInits.emplace_back(InitRef);
+  LLVM_DEBUG(llvm::dbgs() << __PRETTY_FUNCTION__ << ":Data.FirstprivateInits.size() = " << Data.FirstprivateInits.size() << "\n");
   return OrigVD;
 }
 
@@ -5167,6 +5217,7 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
   VarDecl *PVD = nullptr;
   VarDecl *SVD = nullptr;
   VarDecl *MVD = nullptr;
+  LLVM_DEBUG(llvm::dbgs() << "NumberofTargetItems = " << InputInfo.NumberOfTargetItems << "\n");
   if (InputInfo.NumberOfTargetItems > 0) {
     auto *CD = CapturedDecl::Create(
         getContext(), getContext().getTranslationUnitDecl(), /*NumParams=*/0);
@@ -5263,6 +5314,7 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
     }
     BodyGen(CGF);
   };
+  LLVM_DEBUG(llvm::dbgs() << Data << "\n");
   llvm::Function *OutlinedFn = CGM.getOpenMPRuntime().emitTaskOutlinedFunction(
       S, *I, *PartId, *TaskT, EKind, CodeGen, /*Tied=*/true,
       Data.NumberOfParts);

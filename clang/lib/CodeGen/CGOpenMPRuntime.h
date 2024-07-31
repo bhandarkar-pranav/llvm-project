@@ -122,6 +122,9 @@ struct OMPTaskDataTy final {
   bool IsReductionWithTaskMod = false;
   bool IsWorksharingReduction = false;
   bool HasNowaitClause = false;
+  friend raw_ostream &operator<< (raw_ostream &OS,
+                                  const OMPTaskDataTy &Data);
+
 };
 
 /// Class intended to support codegen of all kind of the reduction clauses.

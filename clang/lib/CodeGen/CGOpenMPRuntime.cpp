@@ -40,12 +40,15 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/AtomicOrdering.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
 #include <cstdint>
 #include <numeric>
 #include <optional>
+
+#define DEBUG_TYPE "clang-openmp-codegen"
 
 using namespace clang;
 using namespace CodeGen;
