@@ -314,19 +314,16 @@ namespace clang {
 namespace CodeGen {
 raw_ostream &operator<<(raw_ostream &OS, const OMPTaskDataTy &Data) {
 
-  // auto &&PrintVector = [&OS](std::string Name, const SmallVector<const Expr *, 4> &V) {
+  // auto &&PrintVector = [&OS](std::string Name, const SmallVector<const Expr
+  // *, 4> &V) {
   //   OS << "PrivateVars = {\n";
   //   for (auto &PV : V) {
   //     OS << PV << "\n";
   //   }
   //   OS << "}\n";
   // };
-  auto &&Start = [&OS](std::string Name) {
-    OS << Name << " = {\n";
-  };
-  auto &&End = [&OS]() {
-    OS << "}\n";
-  };
+  auto &&Start = [&OS](std::string Name) { OS << Name << " = {\n"; };
+  auto &&End = [&OS]() { OS << "}\n"; };
 
   Start("PrivateVars");
   for (auto &E : Data.PrivateVars) {
@@ -354,7 +351,7 @@ raw_ostream &operator<<(raw_ostream &OS, const OMPTaskDataTy &Data) {
     E->dump();
   }
   End();
-  
+
   return OS;
 }
 } // namespace CodeGen
@@ -5172,7 +5169,9 @@ createImplicitFirstprivateForType(ASTContext &C, OMPTaskDataTy &Data,
   Data.FirstprivateVars.emplace_back(OrigRef);
   Data.FirstprivateCopies.emplace_back(PrivateRef);
   Data.FirstprivateInits.emplace_back(InitRef);
-  LLVM_DEBUG(llvm::dbgs() << __PRETTY_FUNCTION__ << ":Data.FirstprivateInits.size() = " << Data.FirstprivateInits.size() << "\n");
+  LLVM_DEBUG(llvm::dbgs() << __PRETTY_FUNCTION__
+                          << ":Data.FirstprivateInits.size() = "
+                          << Data.FirstprivateInits.size() << "\n");
   return OrigVD;
 }
 
@@ -5217,7 +5216,8 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
   VarDecl *PVD = nullptr;
   VarDecl *SVD = nullptr;
   VarDecl *MVD = nullptr;
-  LLVM_DEBUG(llvm::dbgs() << "NumberofTargetItems = " << InputInfo.NumberOfTargetItems << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "NumberofTargetItems = "
+                          << InputInfo.NumberOfTargetItems << "\n");
   if (InputInfo.NumberOfTargetItems > 0) {
     auto *CD = CapturedDecl::Create(
         getContext(), getContext().getTranslationUnitDecl(), /*NumParams=*/0);
