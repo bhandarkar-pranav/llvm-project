@@ -7065,45 +7065,27 @@ void OpenMPIRBuilder::emitOffloadingArraysAndArgs(
                        DeviceAddrCB, CustomMapperCB);
   emitOffloadingArraysArgument(Builder, RTArgs, Info, ForEndCall);
 }
+// This is a helper function of emitTargetCall.
+// It is called when we are certain that we are going to offload to a target
+// device (i.e. OutlinedFnID != nullptr).
+// This function does the following
+// 1. Emits the arrays of base pointers, mappers etc that are required by th
+//    OpenMP runtime for offloading (See
+//    OpenMPIRBuilder::emitOffloadingarraysandargs)
+// 2. Sets up TargetKernelArgs.
+// 3. The kernel is then launched either by first creating a target task (See
+// OpenMPIRBuilder::emitTargetTask) or without it (see
+// OpenMPIRBuilder::emitKernelLaunch)
 
-static void emitTargetCall(
+static OpenMPIRBuilder::InsertPointTy emitTargetCallKernelLaunch(
     OpenMPIRBuilder &OMPBuilder, IRBuilderBase &Builder,
     OpenMPIRBuilder::InsertPointTy AllocaIP, Function *OutlinedFn,
     Constant *OutlinedFnID, int32_t NumTeams, int32_t NumThreads,
-    SmallVectorImpl<Value *> &Args,
+    SmallVectorImpl<Value *> &Args, bool RequiresOuterTargetTask,
     OpenMPIRBuilder::GenMapInfoCallbackTy GenMapInfoCB,
-    SmallVector<llvm::OpenMPIRBuilder::DependData> Dependencies = {}) {
-  // Generate a function call to the host fallback implementation of the target
-  // region. This is called by the host when no offload entry was generated for
-  // the target region and when the offloading call fails at runtime.
-  auto &&EmitTargetCallFallbackCB =
-      [&](OpenMPIRBuilder::InsertPointTy IP) -> OpenMPIRBuilder::InsertPointTy {
-    Builder.restoreIP(IP);
-    Builder.CreateCall(OutlinedFn, Args);
-    return Builder.saveIP();
-  };
-
-  bool HasNoWait = false;
-  bool HasDependencies = Dependencies.size() > 0;
-  bool RequiresOuterTargetTask = HasNoWait || HasDependencies;
-
-  // If we don't have an ID for the target region, it means an offload entry
-  // wasn't created. In this case we just run the host fallback directly.
-  if (!OutlinedFnID) {
-    if (RequiresOuterTargetTask) {
-      // Arguments that are intended to be directly forwarded to an
-      // emitKernelLaunch call are pased as nullptr, since OutlinedFnID=nullptr
-      // results in that call not being done.
-      OpenMPIRBuilder::TargetKernelArgs KArgs;
-      Builder.restoreIP(OMPBuilder.emitTargetTask(
-          OutlinedFn, /*OutlinedFnID=*/nullptr, EmitTargetCallFallbackCB, KArgs,
-          /*DeviceID=*/nullptr, /*RTLoc=*/nullptr, AllocaIP, Dependencies,
-          HasNoWait));
-    } else {
-      Builder.restoreIP(EmitTargetCallFallbackCB(Builder.saveIP()));
-    }
-    return;
-  }
+    OpenMPIRBuilder::EmitFallbackCallbackTy EmitTargetCallFallbackCB,
+    SmallVector<llvm::OpenMPIRBuilder::DependData> &Dependencies,
+    bool HasNoWait = false) {
 
   OpenMPIRBuilder::TargetDataInfo Info(
       /*RequiresDevicePointerInfo=*/false,
@@ -7115,7 +7097,6 @@ static void emitTargetCall(
                                          RTArgs, MapInfo,
                                          /*IsNonContiguous=*/true,
                                          /*ForEndCall=*/false);
-
   unsigned NumTargetItems = Info.NumberOfPtrs;
   // TODO: Use correct device ID
   Value *DeviceID = Builder.getInt64(OMP_DEVICEID_UNDEF);
@@ -7136,14 +7117,61 @@ static void emitTargetCall(
 
   // The presence of certain clauses on the target directive require the
   // explicit generation of the target task.
-  if (RequiresOuterTargetTask) {
+  if (RequiresOuterTargetTask)
     Builder.restoreIP(OMPBuilder.emitTargetTask(
         OutlinedFn, OutlinedFnID, EmitTargetCallFallbackCB, KArgs, DeviceID,
         RTLoc, AllocaIP, Dependencies, HasNoWait));
-  } else {
+  else
     Builder.restoreIP(OMPBuilder.emitKernelLaunch(
         Builder, OutlinedFn, OutlinedFnID, EmitTargetCallFallbackCB, KArgs,
         DeviceID, RTLoc, AllocaIP));
+  return Builder.saveIP();
+}
+
+static void emitTargetCall(
+    OpenMPIRBuilder &OMPBuilder, IRBuilderBase &Builder,
+    OpenMPIRBuilder::InsertPointTy AllocaIP, Function *OutlinedFn,
+    Constant *OutlinedFnID, int32_t NumTeams, int32_t NumThreads,
+    SmallVectorImpl<Value *> &Args,
+    OpenMPIRBuilder::GenMapInfoCallbackTy GenMapInfoCB,
+    SmallVector<llvm::OpenMPIRBuilder::DependData> Dependencies = {}) {
+
+  // Generate a function call to the host fallback implementation of the target
+  // region. This is called by the host when no offload entry was generated for
+  // the target region and when the offloading call fails at runtime.
+  auto &&EmitTargetCallFallbackCB =
+      [&](OpenMPIRBuilder::InsertPointTy IP) -> OpenMPIRBuilder::InsertPointTy {
+    Builder.restoreIP(IP);
+    Builder.CreateCall(OutlinedFn, Args);
+    return Builder.saveIP();
+  };
+
+  // TODO: Fix when the nowait clause has been implemented
+  bool HasNoWait = false;
+  bool HasDependencies = Dependencies.size() > 0;
+  bool RequiresOuterTargetTask = HasNoWait || HasDependencies;
+
+  // If we don't have an ID for the target region, it means an offload entry
+  // wasn't created. In this case we just run the host fallback directly.
+  if (OutlinedFnID) {
+    Builder.restoreIP(emitTargetCallKernelLaunch(
+        OMPBuilder, Builder, AllocaIP, OutlinedFn, OutlinedFnID, NumTeams,
+        NumThreads, Args, RequiresOuterTargetTask, GenMapInfoCB,
+        EmitTargetCallFallbackCB, Dependencies, HasNoWait));
+  } else {
+    if (RequiresOuterTargetTask) {
+      // Arguments that are intended to be directly forwarded to an
+      // emitKernelLaunch call are pased as nullptr, since OutlinedFnID=nullptr
+      // results in that call not being done.
+      OpenMPIRBuilder::TargetKernelArgs KArgs;
+      Builder.restoreIP(OMPBuilder.emitTargetTask(
+          OutlinedFn, /*OutlinedFnID=*/nullptr, EmitTargetCallFallbackCB, KArgs,
+          /*DeviceID=*/nullptr, /*RTLoc=*/nullptr, AllocaIP, Dependencies,
+          HasNoWait));
+    } else {
+      Builder.restoreIP(EmitTargetCallFallbackCB(Builder.saveIP()));
+    }
+    return;
   }
 }
 
