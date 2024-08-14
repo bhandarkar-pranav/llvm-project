@@ -7063,7 +7063,15 @@ void OpenMPIRBuilder::emitOffloadingArraysAndArgs(
     function_ref<Value *(unsigned int)> CustomMapperCB) {
   emitOffloadingArrays(AllocaIP, CodeGenIP, CombinedInfo, Info, IsNonContiguous,
                        DeviceAddrCB, CustomMapperCB);
+  llvm::errs() << "After emitoffloadingarrays\n";
+  llvm::errs() << "Basepointers array after emitoffloadingarrays is "
+               << *Info.RTArgs.BasePointersArray << "\n";
+  Builder.GetInsertBlock()->dump();
   emitOffloadingArraysArgument(Builder, RTArgs, Info, ForEndCall);
+  llvm::errs() << "After emitoffloadingarraysArgument\n";
+  llvm::errs() << "Basepointers array after emitoffloadingarraysArgument is "
+               << *RTArgs.BasePointersArray << "\n";
+  Builder.GetInsertBlock()->dump();
 }
 // This is a helper function of emitTargetCall.
 // It is called when we are certain that we are going to offload to a target
@@ -7098,6 +7106,9 @@ static OpenMPIRBuilder::InsertPointTy emitTargetCallKernelLaunch(
                                          /*IsNonContiguous=*/true,
                                          /*ForEndCall=*/false);
   unsigned NumTargetItems = Info.NumberOfPtrs;
+  LLVM_DEBUG(llvm::dbgs() << "NumTargetItems = " << NumTargetItems << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "RTArgs.BasePointersArray = "
+                          << *RTArgs.BasePointersArray << "\n");
   // TODO: Use correct device ID
   Value *DeviceID = Builder.getInt64(OMP_DEVICEID_UNDEF);
   Value *NumTeamsVal = Builder.getInt32(NumTeams);

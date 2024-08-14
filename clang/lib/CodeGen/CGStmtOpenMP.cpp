@@ -349,6 +349,12 @@ raw_ostream &operator<<(raw_ostream &OS, const OMPTaskDataTy &Data) {
   Start("FirstprivateInits");
   for (auto &E : Data.FirstprivateInits) {
     E->dump();
+    if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const ValueDecl *VD = DRE->getDecl();
+      if (VD) {
+        VD->dump();
+      }
+    }
   }
   End();
 
@@ -5169,8 +5175,10 @@ createImplicitFirstprivateForType(ASTContext &C, OMPTaskDataTy &Data,
   Data.FirstprivateVars.emplace_back(OrigRef);
   Data.FirstprivateCopies.emplace_back(PrivateRef);
   Data.FirstprivateInits.emplace_back(InitRef);
-  LLVM_DEBUG(llvm::dbgs() << __PRETTY_FUNCTION__
-                          << ":Data.FirstprivateInits.size() = "
+  LLVM_DEBUG(llvm::dbgs() << __PRETTY_FUNCTION__ << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "Ty = "; Ty.dump());
+  LLVM_DEBUG(llvm::dbgs() << "ElemType = "; ElemType.dump());
+  LLVM_DEBUG(llvm::dbgs() << "Data.FirstprivateInits.size() = "
                           << Data.FirstprivateInits.size() << "\n");
   return OrigVD;
 }
@@ -5318,6 +5326,8 @@ void CodeGenFunction::EmitOMPTargetTaskBasedDirective(
   llvm::Function *OutlinedFn = CGM.getOpenMPRuntime().emitTaskOutlinedFunction(
       S, *I, *PartId, *TaskT, EKind, CodeGen, /*Tied=*/true,
       Data.NumberOfParts);
+  LLVM_DEBUG(llvm::dbgs() << "TaskOutlinedFunction is :- \n"
+                          << *OutlinedFn << "\n");
   llvm::APInt TrueOrFalse(32, S.hasClausesOfKind<OMPNowaitClause>() ? 1 : 0);
   IntegerLiteral IfCond(getContext(), TrueOrFalse,
                         getContext().getIntTypeForBitwidth(32, /*Signed=*/0),

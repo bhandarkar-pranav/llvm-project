@@ -3254,7 +3254,25 @@ emitTaskPrivateMappingFunction(CodeGenModule &CGM, SourceLocation Loc,
   CGF.FinishFunction();
   return TaskPrivatesMap;
 }
+static void dumpPrivates(ArrayRef<PrivateDataTy> Privates) {
 
+  llvm::dbgs() << "\n" << __PRETTY_FUNCTION__ << "\n";
+  for (const PrivateDataTy &Pair : Privates) {
+    const PrivateHelpersTy &P = Pair.second;
+    llvm::dbgs() << "Private { \n";
+    llvm::dbgs() << "Original = " << *P.Original << ";\n";
+    if (P.isLocalPrivate()) {
+      llvm::dbgs() << "LocalPrivate:\n";
+    } else {
+      llvm::dbgs() << "OriginalRef: ";
+      P.OriginalRef->dump();
+      llvm::dbgs() << "PrivateCopy: " << *P.PrivateCopy << ";\n";
+      llvm::dbgs() << "PrivateElemInit: " << *P.PrivateElemInit << ";\n";
+    }
+    llvm::dbgs() << "}\n";
+  }
+  llvm::dbgs() << "\n" << __PRETTY_FUNCTION__ << " done.\n";
+}
 /// Emit initialization for private variables in task-based directives.
 static void emitPrivatesInit(CodeGenFunction &CGF,
                              const OMPExecutableDirective &D,
@@ -3263,6 +3281,8 @@ static void emitPrivatesInit(CodeGenFunction &CGF,
                              QualType SharedsTy, QualType SharedsPtrTy,
                              const OMPTaskDataTy &Data,
                              ArrayRef<PrivateDataTy> Privates, bool ForDup) {
+
+  LLVM_DEBUG(dumpPrivates(Privates));
   ASTContext &C = CGF.getContext();
   auto FI = std::next(KmpTaskTWithPrivatesQTyRD->field_begin());
   LValue PrivatesBase = CGF.EmitLValueForField(TDBase, *FI);
@@ -3295,6 +3315,13 @@ static void emitPrivatesInit(CodeGenFunction &CGF,
     }
     const VarDecl *VD = Pair.second.PrivateCopy;
     const Expr *Init = VD->getAnyInitializer();
+    LLVM_DEBUG(if (Init) {
+      Init->dump();
+      if (CGF.isTrivialInitializer(Init))
+        llvm::dbgs() << "Trivial initializer \n";
+      else
+        llvm::dbgs() << "NonTrivial initializer \n";
+    });
     if (Init && (!ForDup || (isa<CXXConstructExpr>(Init) &&
                              !CGF.isTrivialInitializer(Init)))) {
       LValue PrivateLValue = CGF.EmitLValueForField(PrivatesBase, *FI);
@@ -3634,6 +3661,8 @@ CGOpenMPRuntime::emitTaskInit(CodeGenFunction &CGF, SourceLocation Loc,
   const auto *IElemInitRef = Data.FirstprivateInits.begin();
   for (const Expr *E : Data.FirstprivateVars) {
     const auto *VD = cast<VarDecl>(cast<DeclRefExpr>(E)->getDecl());
+    LLVM_DEBUG(llvm::dbgs() << __PRETTY_FUNCTION__ << " : VD is " << VD << ": "
+                            << *VD << "\n");
     Privates.emplace_back(
         C.getDeclAlign(VD),
         PrivateHelpersTy(
