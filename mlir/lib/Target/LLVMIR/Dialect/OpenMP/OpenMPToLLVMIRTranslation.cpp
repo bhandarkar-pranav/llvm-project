@@ -3417,6 +3417,7 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
     auto *privArgsEnd = privArgsStart + targetOp.getPrivateVars().size();
     BitVector blockArgsBV(firstTargetBlock.getNumArguments(), false);
     omp::PrivateClauseOps newPrivateClauses;
+
     MutableArrayRef argSubRangePrivates(privArgsStart, privArgsEnd);
     for (auto [privVar, privatizerNameAttr, blockArg] :
          llvm::zip_equal(privateVars, *privateSyms, argSubRangePrivates)) {
