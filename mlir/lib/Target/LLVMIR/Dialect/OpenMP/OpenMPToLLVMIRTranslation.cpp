@@ -1366,7 +1366,39 @@ private:
   unsigned privateArgBeginIdx;
   unsigned privateArgEndIdx;
 };
-
+namespace {
+// pdb
+static omp::PrivateClauseOp
+clonePrivatizer(Operation *op, SymbolRefAttr privSym,
+                mlir::IRRewriter &irRewriter, MLIRContext &context) {
+  using InsertPt = mlir::OpBuilder::InsertPoint;
+  omp::PrivateClauseOp privatizer =
+          SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(
+              op, privSym);
+  InsertPt savedIP = irRewriter.saveInsertionPoint();
+  irRewriter.setInsertionPoint(privatizer);
+  auto clonedPrivatizer =
+          llvm::cast<omp::PrivateClauseOp>(irRewriter.clone(*privatizer));
+  irRewriter.restoreInsertionPoint(savedIP);
+  // Unique the clone name to avoid clashes in the symbol table.
+  unsigned counter = 0;
+  SmallString<256> cloneName = SymbolTable::generateSymbolName<256>(
+      privatizer.getSymName(),
+      [&](llvm::StringRef candidate) {
+        return SymbolTable::lookupNearestSymbolFrom(
+            op, StringAttr::get(&context, candidate)) !=
+            nullptr;
+      },
+      counter);
+  clonedPrivatizer.setSymName(cloneName);
+  return clonedPrivatizer;
+}
+static void cloneRegionForPrivatization(Region &src, Region &dst,
+                                        Region::iterator destPos,
+                                        IRMapping &cloneMap) {
+  src.cloneInto(&dst, destPos, cloneMap);
+}    
+} //  namespace
 /// Converts the OpenMP parallel operation to LLVM IR.
 static LogicalResult
 convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
@@ -1544,6 +1576,7 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
           // gets inlined in the parallel region and therefore processing the
           // original op is dangerous.
 
+          // Todo_PDB_start: Change this to use clonePrivatizer -----
           MLIRContext &context = moduleTranslation.getContext();
           mlir::IRRewriter opCloner(&context);
           opCloner.setInsertionPoint(privatizer);
@@ -1562,6 +1595,7 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
               counter);
 
           clone.setSymName(cloneName);
+          // todo_PDB_end: till here --------------------------
           return {privVar, clone};
         }
       }
@@ -3342,159 +3376,126 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
       isTargetDevice || !ompBuilder->Config.TargetTriples.empty();
 
   omp::TargetOp targetOpInst = dyn_cast<omp::TargetOp>(opInst);
-  if (!targetOpInst.getPrivateVars().empty()) {
-    auto privateVars = targetOpInst.getPrivateVars();
-    auto privateSyms = targetOpInst.getPrivateSyms();
-    auto &firstTargetOpRegion = opInst.getRegion(0);
-    auto *regionArgsStart = firstTargetOpRegion.front().getArguments().begin();
-    auto *regionArgsEnd = firstTargetOpRegion.front().getArguments().end();
-    auto *privArgsStart = regionArgsStart + targetOpInst.getMapVars().size();
-    auto *privArgsEnd = privArgsStart + targetOpInst.getPrivateVars().size();
+  if (!targetOp.getPrivateVars().empty()) {
+    auto privateVars = targetOp.getPrivateVars();
+    auto privateSyms = targetOp.getPrivateSyms();
+    auto &firstTargetRegion = opInst.getRegion(0);
+    auto *regionArgsStart = firstTargetRegion.front().getArguments().begin();
+    auto *privArgsStart = regionArgsStart + targetOp.getMapVars().size();
+    auto *privArgsEnd = privArgsStart + targetOp.getPrivateVars().size();
 
     MutableArrayRef argSubRangePrivates(privArgsStart, privArgsEnd);
     for (auto [privVar, privatizerNameAttr, blockArg] :
          llvm::zip_equal(privateVars, *privateSyms, argSubRangePrivates)) {
-      // Look up privatizer
 
       SymbolRefAttr privSym = llvm::cast<SymbolRefAttr>(privatizerNameAttr);
-      omp::PrivateClauseOp privatizer =
-          SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(
-              targetOpInst, privSym);
-      // Clone the privatizer
+
+      // 1. Clone the privatizer so that we can make changes to it freely
       MLIRContext &context = moduleTranslation.getContext();
-      mlir::IRRewriter opCloner(&context);
-      opCloner.setInsertionPoint(privatizer);
-      auto clonedPrivatizer =
-          llvm::cast<omp::PrivateClauseOp>(opCloner.clone(*privatizer));
-
-      // Unique the clone name to avoid clashes in the symbol table.
-      unsigned counter = 0;
-      SmallString<256> cloneName = SymbolTable::generateSymbolName<256>(
-          privatizer.getSymName(),
-          [&](llvm::StringRef candidate) {
-            return SymbolTable::lookupNearestSymbolFrom(
-                       targetOpInst, StringAttr::get(&context, candidate)) !=
-                   nullptr;
-          },
-          counter);
-
-      clonedPrivatizer.setSymName(cloneName);
-
+      mlir::IRRewriter rewriter(&context);
+      auto clonedPrivatizer = clonePrivatizer(&opInst, privSym, rewriter, context);
+      if (clonedPrivatizer.getDataSharingType() !=
+          omp::DataSharingClauseType::Private)
+        continue;
       LLVM_DEBUG(llvm::dbgs()
                      << "**** moduleOp after cloning the privatizer ****\n";
                  moduleOp.dump(); llvm::dbgs() << "**********\n");
 
-      // get the region aruments that correspond to each privVar
-      size_t numNonPrivateVarsFront =
-          std::distance(regionArgsStart, privArgsStart);
-      LLVM_DEBUG(llvm::dbgs() << "numNonPrivateVarsFront = "
-                              << numNonPrivateVarsFront << "\n");
-      MutableArrayRef argSubRangeFront(regionArgsStart, privArgsStart);
-      MutableArrayRef argSubRangeEnd(privArgsEnd, regionArgsEnd);
-
-      LLVM_DEBUG(llvm::dbgs() << "Num Private Block Args = "
-                              << argSubRangePrivates.size() << "\n");
-      LLVM_DEBUG(llvm::dbgs() << "Private placeholder Block Arg = ";
-                 blockArg.dump(); llvm::dbgs() << "\n");
-      // for (auto &arg : argSubRangePrivates) {
-      //   unsigned argNum = arg.getArgNumber();
-      //   Location loc = arg.getLoc();
-      //   LLVM_DEBUG(llvm::dbgs() << "arg " << argNum << " : " ; arg.dump();
-      //   llvm::dbgs() << "\n");
-      // }
-      // TODO adjust regionArgs for more than one private variable.
-      //
       auto &allocRegion = clonedPrivatizer.getAllocRegion();
       // `alloc` region should have only 1 argument
       assert(allocRegion.getNumArguments() == 1 &&
              "alloc region of omp::PrivateClauseOp should have one argument");
       auto allocRegionArg = allocRegion.getArgument(0);
-      // LLVM_DEBUG(
-      //     llvm::dbgs()
-      //     << "clonedPrivatizer BEFORE
-      //     replaceAllUsesInRegionWith(allocRegionArg, " "privVar,
-      //     allocRegion)"; clonedPrivatizer.dump(); llvm::dbgs() << "\n");
-      // replaceAllUsesInRegionWith(allocRegionArg, privVar, allocRegion);
-      // LLVM_DEBUG(
-      //     llvm::dbgs()
-      //     << "clonedPrivatizer AFTER
-      //     replaceAllUsesInRegionWith(allocRegionArg, " "privVar,
-      //     allocRegion)"; clonedPrivatizer.dump(); llvm::dbgs() << "\n");
-      // LLVM_DEBUG(llvm::dbgs() << "**** moduleOp before inlineRegionBefore
-      // ****\n";
-      //            moduleOp.dump();
-      //            llvm::dbgs() << "**********\n");
+      // Assuming we have the following targetOp and Privatizer
+      // 
+      // omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
+      //   %1 = alloca...
+      //   omp.yield(%1)
+      // }
+      // omp.target map(..) map(..) private(privVar) {
+      //  ^bb0(map_arg0, ..., map_argn, priv_arg0):
+      //    ...
+      //    ...
+      //   store %v, %priv_arg0
+      //   omp.terminator
+      // }
+      // Roughly, we do the following - 
+      // Split the first block (bb0) of the first region of the target into
+      // two block. Then clone the alloc region of the privatizer between the
+      // two new blocks. When cloning replace the alloc argument with privVar.
+      // We'll then have
+      // 
+      // omp.target map(..) map(..) private(privVar) {
+      //  ^bb0(map_arg0, ..., map_argn, priv_arg0, ..., priv_argn):
+      //  ^bb1:  (cloned region)  // no predecessor
+      //   %1 = alloca...
+      //   omp.yield(%1)
+      //  ^bb2:                   // no predecessor
+      //    ...
+      //    ...
+      //   store %v, %priv_arg0
+      //   omp.terminator
+      // }
+      // Next, add an unconditional branch from ^bb0 to ^bb1 and change the
+      // yield in the last block of the cloned alloc region to an unconditional
+      // branch before replacing all uses of 'priv_arg0' with the yielded value
+      // to finally get the following
+      // 
+      // omp.target map(..) map(..) private(privVar) {
+      //  ^bb0(map_arg0, ..., map_argn, priv_arg0, ..., priv_argn):
+      //   llvm.br ^bb1
+      //  ^bb1:  (cloned region) // pred: ^bb0
+      //   %1 = alloca...
+      //   llvm.br ^bb2
+      //  ^bb2:                  // pred: ^bb1
+      //    ...
+      //    ...
+      //   store %v, %1          // %priv_arg0 replaced with the yield value
+      //   omp.terminator
+      // }    
+      Block &firstBlock = firstTargetRegion.front();
+      Block *newBlock = rewriter.splitBlock(&firstBlock, firstBlock.begin());
+      rewriter.setInsertionPointToStart(&firstBlock);
+      Location loc = targetOp.getLoc();
+      rewriter.create<LLVM::BrOp>(loc, ValueRange(), newBlock);
 
-      LLVM_DEBUG(llvm::dbgs()
-                     << "TargetOp before splitting first block is = \n";
-                 targetOpInst.dump(); llvm::dbgs() << "\n");
-      Block &firstBlock = firstTargetOpRegion.front();
-      Block *newBlock = opCloner.splitBlock(&firstBlock, firstBlock.begin());
-      opCloner.setInsertionPointToStart(&firstBlock);
-      Location loc = targetOpInst.getLoc();
-      opCloner.create<LLVM::BrOp>(loc, ValueRange(), newBlock);
-      //      opCloner.create<LLVM::BrOp>
-      LLVM_DEBUG(llvm::dbgs() << "TargetOp after splitting first block is = \n";
-                 targetOpInst.dump(); llvm::dbgs() << "\n");
-
-      IRMapping regionCloningMap;
-      Region::iterator secondBlockIter =
-          std::next(firstTargetOpRegion.begin(), 1);
+      IRMapping cloneMap;
+      cloneMap.map(allocRegionArg, privVar);
+      auto secondBlockIter =
+          std::next(firstTargetRegion.begin(), 1);
+      cloneRegionForPrivatization(allocRegion, firstTargetRegion,
+                                  secondBlockIter, cloneMap);
       unsigned allocRegNumBlocks = allocRegion.getBlocks().size();
-      regionCloningMap.map(allocRegionArg, privVar);
-      allocRegion.cloneInto(&firstTargetOpRegion, secondBlockIter,
-                            regionCloningMap);
-      secondBlockIter = std::next(firstTargetOpRegion.begin(), 1);
-      Region::iterator clonedAllocRegionEndIter =
+      secondBlockIter = std::next(firstTargetRegion.begin(), 1);
+      auto clonedAllocRegionEndIter =
           std::next(secondBlockIter, (allocRegNumBlocks - 1));
       Block &clonedAllocRegEndBlock = *clonedAllocRegionEndIter;
+
       Operation *br = firstBlock.getTerminator();
       LLVM::BrOp brOp = dyn_cast<LLVM::BrOp>(br);
       Operation *yield = clonedAllocRegEndBlock.getTerminator();
       omp::YieldOp yieldOp = dyn_cast<omp::YieldOp>(yield);
       auto newValue = yieldOp.getResults().front();
-      opCloner.setInsertionPointAfter(yield);
+      rewriter.setInsertionPointAfter(yield);
       //      auto replacementVal =
       auto *oldSucc = brOp.getSuccessor();
       brOp.setSuccessor(&*secondBlockIter);
       // TODO:Consider cloning brOp and adding it to clonedAllocRegEngBlock
       // TODO: Can we not simply merge clonedAllocRegEngBlock and oldSucc?
-      opCloner.create<LLVM::BrOp>(loc, ValueRange(), oldSucc);
-      opCloner.replaceAllUsesWith(blockArg, newValue);
-      opCloner.eraseOp(yield);
-      // LLVM_DEBUG(llvm::dbgs() << "New brOp is "; brOp.dump(); llvm::dbgs() <<
-      // "\n"); LLVM_DEBUG(llvm::dbgs() << "TargetOp after region.cloneInto is =
-      // \n";
-      //            targetOpInst.dump(); llvm::dbgs() << "\n");
-      // LLVM_DEBUG(printRegion(firstTargetOpRegion));
-      // Start here-> Replace all uses of the argToBeReplaced
-
-      // for (auto arg : argSubRangeFront) {
-      //   unsigned argNum = arg.getArgNumber();
-      //   Location loc = arg.getLoc();
-
-      // }
-      // for (auto arg : argSubRangeEnd) {
-
-      // }
-
-      // inline
-      // opCloner.inlineRegionBefore(allocRegion, firstTargetOpRegion,
-      //                           targetOpInst.getRegion().begin());
-      // Now fix up the blockarguments
-      // a) First, get all the block arguments upto the private block argument.
-
-      // LLVM_DEBUG(llvm::dbgs() << "**** moduleOp after inlineRegionBefore
-      // ****\n";
-      //            moduleOp.dump();
-      //            llvm::dbgs() << "**********\n");
+      rewriter.create<LLVM::BrOp>(loc, ValueRange(), oldSucc);
+      rewriter.replaceAllUsesWith(blockArg, newValue);
+      rewriter.eraseOp(yield);
     }
-    auto &firstBlock = firstTargetOpRegion.front();
+    // Do some fix ups now.
+    auto &firstBlock = firstTargetRegion.front();
     unsigned firstPrivateBlockArgNo =
         argSubRangePrivates.front().getArgNumber();
     firstBlock.eraseArguments(firstPrivateBlockArgNo, privateVars.size());
+    targetOp.getPrivateVarsMutable().clear();
+    //    targetOp.setPrivateSymsAttr(::mlir::ArrayAttr attr)
     LLVM_DEBUG(llvm::dbgs() << "TargetOp after privatization is = \n";
-               targetOpInst.dump(); llvm::dbgs() << "\n");
+               targetOp.dump(); llvm::dbgs() << "\n");
+
   }
   LogicalResult bodyGenStatus = success();
   using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
