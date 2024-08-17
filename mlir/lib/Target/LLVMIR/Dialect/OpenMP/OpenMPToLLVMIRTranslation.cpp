@@ -13,6 +13,7 @@
 #include "mlir/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/OpenMP/OpenMPClauseOperands.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/Dialect/OpenMP/OpenMPInterfaces.h"
 #include "mlir/IR/IRMapping.h"
@@ -1366,39 +1367,7 @@ private:
   unsigned privateArgBeginIdx;
   unsigned privateArgEndIdx;
 };
-namespace {
-// pdb
-static omp::PrivateClauseOp
-clonePrivatizer(Operation *op, SymbolRefAttr privSym,
-                mlir::IRRewriter &irRewriter, MLIRContext &context) {
-  using InsertPt = mlir::OpBuilder::InsertPoint;
-  omp::PrivateClauseOp privatizer =
-          SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(
-              op, privSym);
-  InsertPt savedIP = irRewriter.saveInsertionPoint();
-  irRewriter.setInsertionPoint(privatizer);
-  auto clonedPrivatizer =
-          llvm::cast<omp::PrivateClauseOp>(irRewriter.clone(*privatizer));
-  irRewriter.restoreInsertionPoint(savedIP);
-  // Unique the clone name to avoid clashes in the symbol table.
-  unsigned counter = 0;
-  SmallString<256> cloneName = SymbolTable::generateSymbolName<256>(
-      privatizer.getSymName(),
-      [&](llvm::StringRef candidate) {
-        return SymbolTable::lookupNearestSymbolFrom(
-            op, StringAttr::get(&context, candidate)) !=
-            nullptr;
-      },
-      counter);
-  clonedPrivatizer.setSymName(cloneName);
-  return clonedPrivatizer;
-}
-static void cloneRegionForPrivatization(Region &src, Region &dst,
-                                        Region::iterator destPos,
-                                        IRMapping &cloneMap) {
-  src.cloneInto(&dst, destPos, cloneMap);
-}    
-} //  namespace
+
 /// Converts the OpenMP parallel operation to LLVM IR.
 static LogicalResult
 convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
@@ -3357,8 +3326,6 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
   if (!targetOpSupported(opInst))
     return failure();
 
-  //  OmpTargetOpConversionManager raii(llvm::dyn_cast<omp::TargetOp>(opInst),
-  //  moduleTranslation);
   llvm::OpenMPIRBuilder *ompBuilder = moduleTranslation.getOpenMPBuilder();
   bool isTargetDevice = ompBuilder->Config.isTargetDevice();
   auto parentFn = opInst.getParentOfType<LLVM::LLVMFuncOp>();
@@ -3375,7 +3342,6 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
   bool isOffloadEntry =
       isTargetDevice || !ompBuilder->Config.TargetTriples.empty();
 
-  omp::TargetOp targetOpInst = dyn_cast<omp::TargetOp>(opInst);
   if (!targetOp.getPrivateVars().empty()) {
     auto privateVars = targetOp.getPrivateVars();
     auto privateSyms = targetOp.getPrivateSyms();
@@ -3383,7 +3349,7 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
     auto *regionArgsStart = firstTargetRegion.front().getArguments().begin();
     auto *privArgsStart = regionArgsStart + targetOp.getMapVars().size();
     auto *privArgsEnd = privArgsStart + targetOp.getPrivateVars().size();
-
+    struct omp::PrivateClauseOps newPrivateClauses;
     MutableArrayRef argSubRangePrivates(privArgsStart, privArgsEnd);
     for (auto [privVar, privatizerNameAttr, blockArg] :
          llvm::zip_equal(privateVars, *privateSyms, argSubRangePrivates)) {
@@ -3393,21 +3359,26 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
       // 1. Clone the privatizer so that we can make changes to it freely
       MLIRContext &context = moduleTranslation.getContext();
       mlir::IRRewriter rewriter(&context);
-      auto clonedPrivatizer = clonePrivatizer(&opInst, privSym, rewriter, context);
-      if (clonedPrivatizer.getDataSharingType() !=
-          omp::DataSharingClauseType::Private)
+      omp::PrivateClauseOp privatizer =
+          SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(&opInst,
+                                                                     privSym);
+      if (privatizer.getDataSharingType() !=
+          omp::DataSharingClauseType::Private) {
+        newPrivateClauses.privateSyms.push_back(privSym);
+        newPrivateClauses.privateVars.push_back(privVar);
         continue;
+      }
       LLVM_DEBUG(llvm::dbgs()
                      << "**** moduleOp after cloning the privatizer ****\n";
                  moduleOp.dump(); llvm::dbgs() << "**********\n");
 
-      auto &allocRegion = clonedPrivatizer.getAllocRegion();
+      auto &allocRegion = privatizer.getAllocRegion();
       // `alloc` region should have only 1 argument
       assert(allocRegion.getNumArguments() == 1 &&
              "alloc region of omp::PrivateClauseOp should have one argument");
       auto allocRegionArg = allocRegion.getArgument(0);
       // Assuming we have the following targetOp and Privatizer
-      // 
+      //
       // omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
       //   %1 = alloca...
       //   omp.yield(%1)
@@ -3419,12 +3390,12 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
       //   store %v, %priv_arg0
       //   omp.terminator
       // }
-      // Roughly, we do the following - 
+      // Roughly, we do the following -
       // Split the first block (bb0) of the first region of the target into
       // two block. Then clone the alloc region of the privatizer between the
       // two new blocks. When cloning replace the alloc argument with privVar.
       // We'll then have
-      // 
+      //
       // omp.target map(..) map(..) private(privVar) {
       //  ^bb0(map_arg0, ..., map_argn, priv_arg0, ..., priv_argn):
       //  ^bb1:  (cloned region)  // no predecessor
@@ -3440,7 +3411,7 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
       // yield in the last block of the cloned alloc region to an unconditional
       // branch before replacing all uses of 'priv_arg0' with the yielded value
       // to finally get the following
-      // 
+      //
       // omp.target map(..) map(..) private(privVar) {
       //  ^bb0(map_arg0, ..., map_argn, priv_arg0, ..., priv_argn):
       //   llvm.br ^bb1
@@ -3452,7 +3423,7 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
       //    ...
       //   store %v, %1          // %priv_arg0 replaced with the yield value
       //   omp.terminator
-      // }    
+      // }
       Block &firstBlock = firstTargetRegion.front();
       Block *newBlock = rewriter.splitBlock(&firstBlock, firstBlock.begin());
       rewriter.setInsertionPointToStart(&firstBlock);
@@ -3461,10 +3432,9 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
 
       IRMapping cloneMap;
       cloneMap.map(allocRegionArg, privVar);
-      auto secondBlockIter =
-          std::next(firstTargetRegion.begin(), 1);
-      cloneRegionForPrivatization(allocRegion, firstTargetRegion,
-                                  secondBlockIter, cloneMap);
+      auto secondBlockIter = std::next(firstTargetRegion.begin(), 1);
+      allocRegion.cloneInto(&firstTargetRegion, secondBlockIter, cloneMap);
+
       unsigned allocRegNumBlocks = allocRegion.getBlocks().size();
       secondBlockIter = std::next(firstTargetRegion.begin(), 1);
       auto clonedAllocRegionEndIter =
@@ -3477,7 +3447,6 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
       omp::YieldOp yieldOp = dyn_cast<omp::YieldOp>(yield);
       auto newValue = yieldOp.getResults().front();
       rewriter.setInsertionPointAfter(yield);
-      //      auto replacementVal =
       auto *oldSucc = brOp.getSuccessor();
       brOp.setSuccessor(&*secondBlockIter);
       // TODO:Consider cloning brOp and adding it to clonedAllocRegEngBlock
@@ -3490,12 +3459,20 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
     auto &firstBlock = firstTargetRegion.front();
     unsigned firstPrivateBlockArgNo =
         argSubRangePrivates.front().getArgNumber();
+    // TODO_PDB: Change this to not erase all block args, only the ones we
+    // privatized out
     firstBlock.eraseArguments(firstPrivateBlockArgNo, privateVars.size());
-    targetOp.getPrivateVarsMutable().clear();
-    //    targetOp.setPrivateSymsAttr(::mlir::ArrayAttr attr)
+    if (newPrivateClauses.privateSyms.empty()) {
+      targetOp.getPrivateVarsMutable().clear();
+      targetOp.removePrivateSymsAttr();
+    } else {
+      targetOp.setPrivateSymsAttr(mlir::ArrayAttr::get(
+          targetOp.getContext(), newPrivateClauses.privateSyms));
+      targetOp.getPrivateVarsMutable().assign(newPrivateClauses.privateVars);
+    }
+
     LLVM_DEBUG(llvm::dbgs() << "TargetOp after privatization is = \n";
                targetOp.dump(); llvm::dbgs() << "\n");
-
   }
   LogicalResult bodyGenStatus = success();
   using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
