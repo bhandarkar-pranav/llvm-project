@@ -3410,8 +3410,8 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
   if (!targetOp.getPrivateVars().empty()) {
     OperandRange privateVars = targetOp.getPrivateVars();
     std::optional<mlir::ArrayAttr> privateSyms = targetOp.getPrivateSyms();
-    auto &firstTargetRegion = opInst.getRegion(0);
-    auto &firstTargetBlock = firstTargetRegion.front();
+    auto &targetRegion = opInst.getRegion(0);
+    auto &firstTargetBlock = targetRegion.front();
     auto *regionArgsStart = firstTargetBlock.getArguments().begin();
     auto *privArgsStart = regionArgsStart + targetOp.getMapVars().size();
     auto *privArgsEnd = privArgsStart + targetOp.getPrivateVars().size();
@@ -3423,7 +3423,7 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
 
       SymbolRefAttr privSym = llvm::cast<SymbolRefAttr>(privatizerNameAttr);
 
-      // 1. Clone the privatizer so that we can make changes to it freely
+      // 1. Look up the privatizer in the symbol table
       MLIRContext &context = moduleTranslation.getContext();
       mlir::IRRewriter rewriter(&context);
       omp::PrivateClauseOp privatizer =
@@ -3457,9 +3457,9 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
       //   omp.terminator
       // }
       // Roughly, we do the following -
-      // Split the first block (bb0) of the first region of the target into
-      // two block. Then clone the alloc region of the privatizer between the
-      // two new blocks. When cloning replace the alloc argument with privVar.
+      // Split the first block (bb0) of the target region into two blocks.
+      // Then, clone the alloc region of the privatizer between the two
+      // new blocks. When cloning replace the alloc argument with privVar.
       // We'll then have
       //
       // omp.target map(..) map(..) private(privVar) {
@@ -3475,8 +3475,9 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
       // }
       // Next, add an unconditional branch from ^bb0 to ^bb1 and change the
       // yield in the last block of the cloned alloc region to an unconditional
-      // branch before replacing all uses of 'priv_arg0' with the yielded value
-      // to finally get the following
+      // branch to the other split block before replacing all uses of
+      // 'priv_arg0' with the yielded value to finally get the following code
+      // structure
       //
       // omp.target map(..) map(..) private(privVar) {
       //  ^bb0(map_arg0, ..., map_argn, priv_arg0, ..., priv_argn):
@@ -3498,29 +3499,28 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
 
       IRMapping cloneMap;
       cloneMap.map(allocRegionArg, privVar);
-      auto secondBlockIter = std::next(firstTargetRegion.begin(), 1);
-      allocRegion.cloneInto(&firstTargetRegion, secondBlockIter, cloneMap);
+      auto newBlockIter = std::next(targetRegion.begin(), 1);
+      allocRegion.cloneInto(&targetRegion, newBlockIter, cloneMap);
 
       unsigned allocRegNumBlocks = allocRegion.getBlocks().size();
-      secondBlockIter = std::next(firstTargetRegion.begin(), 1);
-      auto clonedAllocRegionEndIter =
-          std::next(secondBlockIter, (allocRegNumBlocks - 1));
-      Block &clonedAllocRegEndBlock = *clonedAllocRegionEndIter;
+      newBlockIter = std::next(targetRegion.begin(), 1);
+      auto clonedAllocRegionBackIter =
+          std::next(newBlockIter, (allocRegNumBlocks - 1));
+      Block &clonedAllocRegionLastBlock = *clonedAllocRegionBackIter;
 
-      Operation *br = firstTargetBlock.getTerminator();
-      LLVM::BrOp brOp = dyn_cast<LLVM::BrOp>(br);
-      Operation *yield = clonedAllocRegEndBlock.getTerminator();
-      omp::YieldOp yieldOp = dyn_cast<omp::YieldOp>(yield);
+      LLVM::BrOp brOp = dyn_cast<LLVM::BrOp>(firstTargetBlock.getTerminator());
+      omp::YieldOp yieldOp =
+          dyn_cast<omp::YieldOp>(clonedAllocRegionLastBlock.getTerminator());
       auto newValue = yieldOp.getResults().front();
-      rewriter.setInsertionPointAfter(yield);
+      rewriter.setInsertionPointAfter(yieldOp);
       auto *oldSucc = brOp.getSuccessor();
-      brOp.setSuccessor(&*secondBlockIter);
+      brOp.setSuccessor(&*newBlockIter);
       // TODO:Consider cloning brOp and adding it to clonedAllocRegEngBlock
       // TODO: Can we not simply merge clonedAllocRegEngBlock and oldSucc?
       rewriter.create<LLVM::BrOp>(loc, ValueRange(), oldSucc);
       blockArgsBV.set(blockArg.getArgNumber());
       rewriter.replaceAllUsesWith(blockArg, newValue);
-      rewriter.eraseOp(yield);
+      rewriter.eraseOp(yieldOp);
     }
     // Do some fix ups now.
     // First, remove the blockArguments that we just privatized
