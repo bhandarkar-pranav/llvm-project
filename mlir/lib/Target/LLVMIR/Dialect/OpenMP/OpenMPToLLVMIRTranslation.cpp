@@ -3390,8 +3390,9 @@ createDeviceArgumentAccessor(MapInfoData &mapData, llvm::Argument &arg,
 namespace {
 class Privatizer {
 public:
-  Privatizer(Operation &opInst) : operation(&opInst) {}
-  void privatize(LLVM::ModuleTranslation &moduleTranslation) {
+  Privatizer(Operation &opInst, MLIRContext &context) : operation(&opInst), rewriter(&context) {}
+
+  void privatize() {
     omp::TargetOp targetOp = cast<omp::TargetOp>(operation);
     if (targetOp.getPrivateVars().empty())
       return;
@@ -3412,8 +3413,6 @@ public:
       SymbolRefAttr privSym = llvm::cast<SymbolRefAttr>(privatizerNameAttr);
 
       // 1. Look up the privatizer in the symbol table
-      MLIRContext &context = moduleTranslation.getContext();
-      mlir::IRRewriter rewriter(&context);
       omp::PrivateClauseOp privatizer =
           SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(operation,
                                                                      privSym);
@@ -3444,9 +3443,9 @@ public:
       //   omp.terminator
       // }
       // Roughly, we do the following -
-      // Split the first block (bb0) of the first region of the target into
-      // two block. Then clone the alloc region of the privatizer between the
-      // two new blocks. When cloning replace the alloc argument with privVar.
+      // Split the first block (bb0) of the target region into two blocks.
+      // Then, clone the alloc region of the privatizer between the two
+      // new blocks. When cloning replace the alloc argument with privVar.
       // We'll then have
       //
       // omp.target map(..) map(..) private(privVar) {
@@ -3462,8 +3461,9 @@ public:
       // }
       // Next, add an unconditional branch from ^bb0 to ^bb1 and change the
       // yield in the last block of the cloned alloc region to an unconditional
-      // branch before replacing all uses of 'priv_arg0' with the yielded value
-      // to finally get the following
+      // branch to the other split block before replacing all uses of
+      // 'priv_arg0' with the yielded value to finally get the following code
+      // structure
       //
       // omp.target map(..) map(..) private(privVar) {
       //  ^bb0(map_arg0, ..., map_argn, priv_arg0, ..., priv_argn):
@@ -3477,95 +3477,83 @@ public:
       //   store %v, %1          // %priv_arg0 replaced with the yield value
       //   omp.terminator
       // }
-      Block *newBlock =
-          rewriter.splitBlock(&firstTargetBlock, firstTargetBlock.begin());
-      rewriter.setInsertionPointToStart(&firstTargetBlock);
-      Location loc = targetOp.getLoc();
-      rewriter.create<LLVM::BrOp>(loc, ValueRange(), newBlock);
+
+      // Block *newBlock =
+      //     rewriter.splitBlock(&firstTargetBlock, firstTargetBlock.begin());
+      // rewriter.setInsertionPointToStart(&firstTargetBlock);
+      // Location loc = targetOp.getLoc();
+      // rewriter.create<LLVM::BrOp>(loc, ValueRange(), newBlock);
 
       IRMapping cloneMap;
       cloneMap.map(allocRegionArg, privVar);
-      auto secondBlockIter = std::next(targetRegion.begin(), 1);
-      allocRegion.cloneInto(&targetRegion, secondBlockIter, cloneMap);
-      LLVM::LLVMFuncOp parentFn =
-          operation->getParentOfType<LLVM::LLVMFuncOp>();
-      LLVM_DEBUG(llvm::dbgs()
-                 << "Mapping " << allocRegionArg << " to " << privVar << "\n");
-      LLVM_DEBUG(llvm::dbgs() << "Privatizer is:\n"; privatizer.dump();
-                 llvm::dbgs() << "\n");
-      LLVM_DEBUG(llvm::dbgs() << "parentFn after cloning:\n"; parentFn.dump();
-                 llvm::dbgs() << "\n");
-
-      unsigned allocRegNumBlocks = allocRegion.getBlocks().size();
-      secondBlockIter = std::next(targetRegion.begin(), 1);
-      auto clonedAllocRegionEndIter =
-          std::next(secondBlockIter, (allocRegNumBlocks - 1));
-      Block &clonedAllocRegEndBlock = *clonedAllocRegionEndIter;
-
-      Operation *br = firstTargetBlock.getTerminator();
-      LLVM::BrOp brOp = dyn_cast<LLVM::BrOp>(br);
-      Operation *yield = clonedAllocRegEndBlock.getTerminator();
-      omp::YieldOp yieldOp = dyn_cast<omp::YieldOp>(yield);
-      auto newValue = yieldOp.getResults().front();
-      rewriter.setInsertionPointAfter(yield);
-      auto *oldSucc = brOp.getSuccessor();
-      brOp.setSuccessor(&*secondBlockIter);
-      // TODO:Consider cloning brOp and adding it to clonedAllocRegEngBlock
-      // TODO: Can we not simply merge clonedAllocRegEngBlock and oldSucc?
-      rewriter.create<LLVM::BrOp>(loc, ValueRange(), oldSucc);
+      mlir::Value newValue = inlineRegion(allocRegion, firstTargetBlock,
+                                          firstTargetBlock.begin(), cloneMap);
       blockArgsBV.set(blockArg.getArgNumber());
       rewriter.replaceAllUsesWith(blockArg, newValue);
-      rewriter.eraseOp(yield);
-      LLVM_DEBUG(llvm::dbgs() << "parentFn before fixups:\n"; parentFn.print(
-          llvm::dbgs(), OpPrintingFlags().printGenericOpForm(false));
+
+      LLVM_DEBUG(llvm::dbgs() << "parentFn after cloning:\n";
+                 LLVM::LLVMFuncOp parentFn =
+                 operation->getParentOfType<LLVM::LLVMFuncOp>();
+                 parentFn.dump();
                  llvm::dbgs() << "\n");
 
-      // Find the blocks that exit the region
-      SmallVector<Block *> regionExits;
-      for (auto &b : targetRegion.getBlocks()) {
-        if (b.hasNoSuccessors()) {
-          Operation *termOp = b.getTerminator();
-          assert(termOp->hasTrait<OpTrait::ReturnLike>() ||
-                 llvm::dyn_cast<omp::TerminatorOp>(termOp) &&
-                     "The terminator of a block should either be a ReturnLike "
-                     "Operation"
-                     "or an omp::yield");
-          regionExits.push_back(&b);
-        }
-      }
-      LLVM_DEBUG(llvm::dbgs()
-                 << "Found " << regionExits.size() << " region exits\n");
-      for (auto *b : regionExits) {
-        LLVM_DEBUG(llvm::dbgs()
-                       << "Region exit block with terminator instruction : \n";
-                   b->getTerminator()->dump(); llvm::dbgs() << "\n");
-        Block *newB = rewriter.splitBlock(b, std::prev(b->end(), 1));
-        rewriter.setInsertionPointToEnd(b);
-        Location loc = targetOp.getLoc();
-        rewriter.create<LLVM::BrOp>(loc, ValueRange(), newB);
+      if (!privatizer.getDeallocRegion().empty()) {
+        // // Find the blocks that exit the region
+        // SmallVector<Block *> regionExits;
+        // for (auto &b : targetRegion.getBlocks()) {
+        //   if (b.hasNoSuccessors()) {
+        //     Operation *termOp = b.getTerminator();
+        //     assert(
+        //         termOp->hasTrait<OpTrait::ReturnLike>() ||
+        //         llvm::dyn_cast<omp::TerminatorOp>(termOp) &&
+        //             "The terminator of a block should either be a ReturnLike "
+        //             "Operation"
+        //             "or an omp::yield");
+        //     regionExits.push_back(&b);
+        //   }
+        // }
+        // LLVM_DEBUG(llvm::dbgs()
+        //            << "Found " << regionExits.size() << " region exits\n");
+        // for (auto *b : regionExits) {
+        //   LLVM_DEBUG(
+        //       llvm::dbgs()
+        //           << "Region exit block with terminator instruction : \n";
+        //       b->getTerminator()->dump(); llvm::dbgs() << "\n");
+        //   Block *newB = rewriter.splitBlock(b, std::prev(b->end(), 1));
+        //   rewriter.setInsertionPointToEnd(b);
+        //   Location loc = targetOp.getLoc();
+        //   rewriter.create<LLVM::BrOp>(loc, ValueRange(), newB);
 
-        auto &deallocRegion = privatizer.getDeallocRegion();
-        // `dealloc` region should have only 1 argument
-        assert(deallocRegion.getNumArguments() == 1 &&
-               "alloc region of omp::PrivateClauseOp should have one argument");
-        auto deallocRegionArg = deallocRegion.getArgument(0);
+        //   auto &deallocRegion = privatizer.getDeallocRegion();
+        //   // `dealloc` region should have only 1 argument
+        //   llvm::errs() << "dealloc.getNumArguments() = "
+        //                << deallocRegion.getNumArguments() << "\n";
+        //   assert(deallocRegion.getNumArguments() == 1 &&
+        //          "dealloc region of omp::PrivateClauseOp should have one "
+        //          "argument");
+        //   auto deallocRegionArg = deallocRegion.getArgument(0);
 
-        IRMapping cloneMap;
-        LLVM_DEBUG(llvm::dbgs() << "Replacing "; deallocRegionArg.dump();
-                   llvm::dbgs() << " with "; newValue.dump();
-                   llvm::dbgs() << "\n");
-        cloneMap.map(deallocRegionArg, newValue);
-        //        auto secondBlockIter = std::next(targetRegion.begin(),
-        //        1);
-        // Fix the second argumetn of cloneInto here because we may not always
-        // be inserting before the last block
-        deallocRegion.cloneInto(&targetRegion,
-                                std::prev(targetRegion.end(), 1),
-                                cloneMap);
-        LLVM_DEBUG(llvm::dbgs() << "After cloning dealloc, targetOp is \n";
-                   targetOp.dump(); llvm::dbgs() << "\n");
-        // PDB Start here by fixing up the branches of the cloned region
-      }
+        //   IRMapping cloneMap;
+        //   LLVM_DEBUG(llvm::dbgs() << "Replacing "; deallocRegionArg.dump();
+        //              llvm::dbgs() << " with "; newValue.dump();
+        //              llvm::dbgs() << "\n");
+        //   cloneMap.map(deallocRegionArg, newValue);
+        //   //        auto newBlockIter = std::next(targetRegion.begin(),
+        //   //        1);
+        //   // Fix the second argument of cloneInto here because we may not always
+        //   // be inserting before the last block
+        //   deallocRegion.cloneInto(&targetRegion,
+        //                           std::prev(targetRegion.end(), 1), cloneMap);
+        //   LLVM_DEBUG(llvm::dbgs() << "After cloning dealloc, targetOp is \n";
+        //              targetOp.dump(); llvm::dbgs() << "\n");
+        //   // PDB Start here by fixing up the branches of the cloned region
+        //   rewriter.setInsertionPointToEnd(b);
+        //   LLVM::BrOp brOp = dyn_cast<LLVM::BrOp>(b->getTerminator());
+        //   auto *oldSucc = brOp.getSuccessor();
+        //   brOp.setSuccessor(&*newBlockIter);
+        //   rewriter.create<LLVM::BrOp>(loc, ValueRange(), oldSucc);
+        // } // regionExits
+      } // handle allocatables
     }
     // Do some fix ups now.
     // First, remove the blockArguments that we just privatized
@@ -3585,16 +3573,36 @@ public:
   }
 
 private:
+  // Split block into two blocks at pos.
+  // Inline the blocks of the region src between the two blocks and fix
+  // up branches.
+  // One critical assumption baked into this function is that 'pos' is never the
+  // end of the block. That allows us to avoid ever having to check the terminator
+  // of 'block' - We always know that after the split the end of the original block
+  // needs a new terminator.
+  mlir::Value inlineRegion(Region &src, Block &block, Block::iterator pos, IRMapping &cloneMap) {
+    auto *parentOp = block.getParentOp();
+    auto *destRegion = block.getParent();
+    Location loc = parentOp->getLoc();
+    Block *newBlock = rewriter.splitBlock(&block, pos/*=???*/);
+    auto newBlockIter = newBlock->getIterator();
+    src.cloneInto(destRegion, newBlockIter, cloneMap);
+
+    Block &clonedRegionFirstBlock = *std::next(block.getIterator(), 1);
+    rewriter.setInsertionPointToEnd(&block);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange(), &clonedRegionFirstBlock);
+    Region::iterator clonedRegionLastBlockIter = std::prev(newBlock->getIterator(), 1);
+    //    Block &clonedRegionLastBlock = *clonedRegionLastBlockIter;
+    // We know that the dealloc and alloc regions are terminated by omp.yield. Always.
+    omp::YieldOp yieldOp = dyn_cast<omp::YieldOp>(clonedRegionLastBlockIter->getTerminator());
+    auto newValue = yieldOp.getResults().front();
+    rewriter.setInsertionPointAfter(yieldOp);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange(), newBlock);
+    rewriter.eraseOp(yieldOp);
+    return newValue;
+  }
   Operation *operation = nullptr;
-  // class MappedValues {
-  //   void mapLLVMValue(llvm::Value *llvmV, mlir::Value mlirV) {
-  //     assert(!PrivatizedValues.contains(llvmV) && "Cannot duplicate");
-  //     PrivatizedValues[llvmV] = mlirV;
-  //   }
-  // private:
-  //   DenseMap<llvm::Value *, mlir::Value> PrivatizedValues;
-  // };
-  // MappedValues valueMap;
+  mlir::IRRewriter rewriter;
 };
 } // namespace
 
@@ -3618,7 +3626,7 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
   bool isOffloadEntry =
       isTargetDevice || !ompBuilder->Config.TargetTriples.empty();
 
-  Privatizer(opInst).privatize(moduleTranslation);
+  Privatizer(opInst, moduleTranslation.getContext()).privatize();
 
   LogicalResult bodyGenStatus = success();
   using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
