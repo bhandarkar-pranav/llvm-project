@@ -424,8 +424,22 @@ void DataSharingProcessor::collectPreDeterminedSymbols() {
     collectSymbols(semantics::Symbol::Flag::OmpPreDetermined,
                    preDeterminedSymbols);
 }
-
+bool DataSharingProcessor::privatizedSymNeedsMap(const semantics::Symbol *sym) {
+  lower::SymbolBox hsb = converter.lookupOneLevelUpSymbol(*sym);
+  assert(hsb && "Host symbol box not found");
+  mlir::omp::PrivateClauseOp privatizer = symToPrivatizer.at(sym);
+  mlir::Region &allocRegion = privatizer.getAllocRegion();
+  mlir::Value blockArg0 = allocRegion.getArgument(0);
+  if (blockArg0.use_empty())
+    return false;
+  return true;
+}
+void DataSharingProcessor::mapPrivatizedSymbols() {
+  for (const semantics::Symbol *sym : symbolsToBeMapped) {
+  }
+}
 void DataSharingProcessor::privatize(mlir::omp::PrivateClauseOps *clauseOps) {
+  llvm::errs() << __PRETTY_FUNCTION__ << "\n";
   for (const semantics::Symbol *sym : allPrivatizedSymbols) {
     if (const auto *commonDet =
             sym->detailsIf<semantics::CommonBlockDetails>()) {
@@ -433,6 +447,12 @@ void DataSharingProcessor::privatize(mlir::omp::PrivateClauseOps *clauseOps) {
         doPrivatize(&*mem, clauseOps);
     } else
       doPrivatize(sym, clauseOps);
+    if (privatizedSymNeedsMap(sym)) {
+      llvm::errs() << "privatized symbol " << sym << " NEEDS to be mapped\n";
+      symbolsToBeMapped.insert(sym);
+    } else
+      llvm::errs() << "privatized symbol " << sym
+                   << " DOES NOT need to be mapped \n";
   }
 }
 
@@ -486,6 +506,9 @@ void DataSharingProcessor::doPrivatize(const semantics::Symbol *sym,
                        : mlir::omp::DataSharingClauseType::Private);
     fir::ExtendedValue symExV = converter.getSymbolExtendedValue(*sym);
     lower::SymMapScope outerScope(*symTable);
+    llvm::errs() << "privatizer beginning :\n";
+    result.dump();
+    llvm::errs() << "\n";
 
     // Populate the `alloc` region.
     {
@@ -494,6 +517,9 @@ void DataSharingProcessor::doPrivatize(const semantics::Symbol *sym,
           &allocRegion, /*insertPt=*/{}, symType, symLoc);
 
       firOpBuilder.setInsertionPointToEnd(allocEntryBlock);
+      llvm::errs() << "privatizer after creating entry block :\n";
+      result.dump();
+      llvm::errs() << "\n";
 
       fir::ExtendedValue localExV =
           hlfir::translateToExtendedValue(
@@ -501,13 +527,20 @@ void DataSharingProcessor::doPrivatize(const semantics::Symbol *sym,
               /*contiguousHint=*/
               evaluate::IsSimplyContiguous(*sym, converter.getFoldingContext()))
               .first;
-
+      llvm::errs() << "localExV is \n";
+      localExV.dump();
+      llvm::errs() << "\n";
+      llvm::errs() << "privatizer in the end :\n";
+      result.dump();
+      llvm::errs() << "\n";
       symTable->addSymbol(*sym, localExV);
       lower::SymMapScope innerScope(*symTable);
       cloneSymbol(sym);
       mlir::Value cloneAddr = symTable->shallowLookupSymbol(*sym).getAddr();
       mlir::Type cloneType = cloneAddr.getType();
-
+      llvm::errs() << "cloneAddr = \n";
+      cloneAddr.dump();
+      llvm::errs() << "\n";
       // A `convert` op is required for variables that are storage associated
       // via `equivalence`. The problem is that these variables are declared as
       // `fir.ptr`s while their privatized storage is declared as `fir.ref`,
@@ -554,9 +587,15 @@ void DataSharingProcessor::doPrivatize(const semantics::Symbol *sym,
           symTable->shallowLookupSymbol(*sym).getAddr());
     }
 
+    llvm::errs() << "privatizer in the end :\n";
+    result.dump();
+    llvm::errs() << "\n";
     return result;
   }();
-
+  llvm::errs() << __PRETTY_FUNCTION__ << ": sym is \n";
+  sym->dump();
+  llvm::errs() << __PRETTY_FUNCTION__ << ": symbolbox is \n";
+  hsb.dump();
   if (clauseOps) {
     clauseOps->privateSyms.push_back(mlir::SymbolRefAttr::get(privatizerOp));
     clauseOps->privateVars.push_back(hsb.getAddr());

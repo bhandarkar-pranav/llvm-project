@@ -76,6 +76,7 @@ private:
   llvm::SetVector<const semantics::Symbol *> implicitSymbols;
   llvm::SetVector<const semantics::Symbol *> preDeterminedSymbols;
   llvm::SetVector<const semantics::Symbol *> allPrivatizedSymbols;
+  llvm::SetVector<const semantics::Symbol *> symbolsToBeMapped;
 
   llvm::DenseMap<const semantics::Symbol *, mlir::omp::PrivateClauseOp>
       symToPrivatizer;
@@ -115,6 +116,8 @@ private:
   void copyLastPrivateSymbol(const semantics::Symbol *sym,
                              mlir::OpBuilder::InsertPoint *lastPrivIP);
   void insertDeallocs();
+  bool privatizedSymNeedsMap(const semantics::Symbol *sym);
+  void mapPrivatizedSymbols();
 
 public:
   DataSharingProcessor(lower::AbstractConverter &converter,
