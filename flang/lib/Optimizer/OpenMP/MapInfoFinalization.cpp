@@ -291,6 +291,9 @@ class MapInfoFinalizationPass
         // single new MapInfoOp per new MapInfoOp generated and share it across
         // all users appropriately, making sure to only add a single member link
         // per new generation for the original originating descriptor MapInfoOp.
+        llvm::errs() << "MapInfoOp in " << __FUNCTION__ << " is \n";
+        op.dump();
+        llvm::errs() << "\n";
         assert(llvm::hasSingleElement(op->getUsers()) &&
                "OMPMapInfoFinalization currently only supports single users "
                "of a MapInfoOp");

@@ -1798,6 +1798,9 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
   auto targetOp = firOpBuilder.create<mlir::omp::TargetOp>(loc, clauseOps);
   genBodyOfTargetOp(converter, symTable, semaCtx, eval, targetOp, mapSyms,
                     mapLocs, mapTypes, loc, queue, item, dsp);
+  llvm::errs() << "Generated targetOp";
+  targetOp.getOperation()->getParentOp()->dump();
+  llvm::errs() << "\n";
   return targetOp;
 }
 

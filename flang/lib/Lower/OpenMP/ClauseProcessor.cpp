@@ -896,7 +896,14 @@ void ClauseProcessor::processMapObjects(
     llvm::SmallVectorImpl<mlir::Location> *mapSymLocs,
     llvm::SmallVectorImpl<mlir::Type> *mapSymTypes) const {
   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+  llvm::errs() << "\nENTERING::: " << __FUNCTION__ << "\n";
   for (const omp::Object &object : objects) {
+    llvm::errs() << "Object : {\n sym = { ";
+    object.sym()->dump();
+    llvm::errs() << "}\n";
+    llvm::errs() << "designator (aka Expression) = { ";
+    object.ref()->dump();
+    llvm::errs() << "}\n";
     llvm::SmallVector<mlir::Value> bounds;
     std::stringstream asFortran;
 
@@ -922,10 +929,19 @@ void ClauseProcessor::processMapObjects(
             std::underlying_type_t<llvm::omp::OpenMPOffloadMappingFlags>>(
             mapTypeBits),
         mlir::omp::VariableCaptureKind::ByRef, baseOp.getType());
-
+    llvm::errs() << "baseOp = ";
+    baseOp.dump();
+    llvm::errs() << ": " << baseOp.getType() << "\n";
+    llvm::errs() << "Created MapInfOp:\n";
+    mapOp.dump();
+    llvm::errs() << "\n";
     if (object.sym()->owner().IsDerivedType()) {
+      llvm::errs() << "object.sym() is a member of a derived type\n";
+      object.sym()->dump();
       addChildIndexAndMapToParent(object, parentMemberIndices, mapOp, semaCtx);
     } else {
+      llvm::errs() << "mapping non-derived type\n";
+      llvm::errs() << "{ mapSymType = " << baseOp.getType() << "}\n";
       mapVars.push_back(mapOp);
       if (mapSyms)
         mapSyms->push_back(object.sym());
@@ -935,6 +951,7 @@ void ClauseProcessor::processMapObjects(
         mapSymLocs->push_back(baseOp.getLoc());
     }
   }
+  llvm::errs() << "EXITING:::: " << __FUNCTION__ << "\n\n";
 }
 
 bool ClauseProcessor::processMap(
@@ -1002,7 +1019,8 @@ bool ClauseProcessor::processMap(
                           parentMemberIndices, result.mapVars, ptrMapSyms,
                           mapSymLocs, mapSymTypes);
       });
-
+  llvm::errs() << "parentMemberIndices.size() = " << parentMemberIndices.size()
+               << "\n";
   insertChildMapInfoIntoParent(converter, parentMemberIndices, result.mapVars,
                                *ptrMapSyms, mapSymTypes, mapSymLocs);
 
