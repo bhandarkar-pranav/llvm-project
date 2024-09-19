@@ -3417,7 +3417,7 @@ public:
       omp::PrivateClauseOp privatizer =
           SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(operation,
                                                                      privSym);
-      // Handle only private for now. Also, not handling allocatables yet.
+      // Handle only private for now.
       if (privatizer.getDataSharingType() !=
           omp::DataSharingClauseType::Private) {
         newPrivateClauses.privateSyms.push_back(privSym);
@@ -3485,8 +3485,18 @@ public:
       // rewriter.setInsertionPointToStart(&firstTargetBlock);
       // Location loc = targetOp.getLoc();
       // rewriter.create<LLVM::BrOp>(loc, ValueRange(), newBlock);
-
       IRMapping cloneMap;
+      if (useMappedValue(privatizer)) {
+        privVar = findMappedValue(targetOp, privVar);
+        llvm::errs() << "Using Mapped Value for privatization \n";
+        privVar.dump();
+        llvm::errs() << "\n";
+      } else {
+        llvm::errs() << "NOT USING Mapped Value for Privatization \n";
+        privVar.dump();
+        llvm::errs() << "\n";
+      }
+
       cloneMap.map(allocRegionArg, privVar);
       mlir::Value privatizedValue = inlineRegion(
           allocRegion, firstTargetBlock, firstTargetBlock.begin(), cloneMap);
@@ -3504,11 +3514,11 @@ public:
         for (auto &b : targetRegion.getBlocks()) {
           if (b.hasNoSuccessors()) {
             Operation *termOp = b.getTerminator();
-            assert(termOp->hasTrait<OpTrait::ReturnLike>() ||
-                   llvm::dyn_cast<omp::TerminatorOp>(termOp) &&
-                       "The terminator of a block should either be a "
-                       "ReturnLike operation"
-                       "or an omp::yield");
+            assert((termOp->hasTrait<OpTrait::ReturnLike>() ||
+                    llvm::dyn_cast<omp::TerminatorOp>(termOp)) &&
+                   "The terminator of a block should either be a "
+                   "ReturnLike operation"
+                   "or an omp::yield");
             regionExits.push_back(&b);
           }
         }
@@ -3561,6 +3571,8 @@ private:
   // end of the block. That allows us to avoid ever having to check the
   // terminator of 'block' - We always know that after the split the end of the
   // original block needs a new terminator.
+#undef LLVM_DEBUG
+#define LLVM_DEBUG(x) x
   mlir::Value inlineRegion(Region &src, Block &block, Block::iterator pos,
                            IRMapping &cloneMap) {
     auto *parentOp = block.getParentOp();
@@ -3602,6 +3614,28 @@ private:
       return yieldOp.getResults().front();
     return Value();
   }
+#undef LLVM_DEBUG
+  bool useMappedValue(omp::PrivateClauseOp privatizer) {
+    Region &allocRegion = privatizer.getAllocRegion();
+    Value blockArg0 = allocRegion.getArgument(0);
+    return !blockArg0.use_empty();
+  };
+  // For a given privatized value, find the mlir value that
+  // represents its matched version
+
+  mlir::Value findMappedValue(omp::TargetOp targetOp, mlir::Value privVar) {
+    // First, find the mapInfoOp for this
+    Block &targetEntryBlock = targetOp.getRegion().getBlocks().front();
+    unsigned argIndex = 0;
+    for (const auto &mapVar : targetOp.getMapVars()) {
+      auto mapInfoOp = dyn_cast<omp::MapInfoOp>(mapVar.getDefiningOp());
+      if (privVar == mapInfoOp.getVarPtr())
+        return targetEntryBlock.getArgument(argIndex);
+      argIndex++;
+    }
+    return Value{};
+  }
+
   Operation *operation = nullptr;
   mlir::IRRewriter rewriter;
 };
