@@ -923,6 +923,7 @@ fir::factory::AddrAndBoundsInfo gatherDataOperandAddrAndBounds(
 
     auto arrayBase = toMaybeExpr(arrayRef->base());
     assert(arrayBase);
+
     if (detail::getRef<evaluate::Component>(*arrayBase)) {
       dataExv = converter.genExprAddr(operandLocation, *arrayBase, stmtCtx);
       info.addr = fir::getBase(dataExv);
@@ -951,11 +952,10 @@ fir::factory::AddrAndBoundsInfo gatherDataOperandAddrAndBounds(
     info.addr = fir::getBase(compExv);
     info.rawInput = info.addr;
     if (genDefaultBounds &&
-        mlir::isa<fir::SequenceType>(fir::unwrapRefType(info.addr.getType()))) {
+        mlir::isa<fir::SequenceType>(fir::unwrapRefType(info.addr.getType())))
       bounds = fir::factory::genBaseBoundsOps<BoundsOp, BoundsType>(
           builder, operandLocation, compExv,
           /*isAssumedSize=*/false);
-    }
     asFortran << designator.AsFortran();
 
     if (semantics::IsOptional(compRef->GetLastSymbol())) {
