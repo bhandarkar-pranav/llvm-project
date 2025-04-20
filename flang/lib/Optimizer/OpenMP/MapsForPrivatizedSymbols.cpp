@@ -22,6 +22,7 @@
 // 2. Generalize this for more than just omp.target ops.
 //===----------------------------------------------------------------------===//
 
+#include "flang/Optimizer/Builder/Character.h"
 #include "flang/Optimizer/Builder/FIRBuilder.h"
 #include "flang/Optimizer/Dialect/FIRType.h"
 #include "flang/Optimizer/Dialect/Support/KindMapping.h"
@@ -51,12 +52,14 @@ class MapsForPrivatizedSymbolsPass
     : public flangomp::impl::MapsForPrivatizedSymbolsPassBase<
           MapsForPrivatizedSymbolsPass> {
 
-  omp::MapInfoOp createMapInfo(Location loc, Value var,
-                               fir::FirOpBuilder &builder) {
+  int createMapInfo(Location loc, Value var,
+                     fir::FirOpBuilder &builder,
+                     llvm::SmallVectorImpl<omp::MapInfoOp> &mapInfoOps) {
     uint64_t mapTypeTo = static_cast<
         std::underlying_type_t<llvm::omp::OpenMPOffloadMappingFlags>>(
         llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO);
     Operation *definingOp = var.getDefiningOp();
+    int64_t numMapsGenerated = 0;
 
     Value varPtr = var;
     // We want the first result of the hlfir.declare op because our goal
@@ -69,6 +72,39 @@ class MapsForPrivatizedSymbolsPass
     if (auto declOp = llvm::dyn_cast_if_present<hlfir::DeclareOp>(definingOp))
       varPtr = declOp.getBase();
 
+    // If the varPtr is a BoxCharType, we should create a MapInfo for the underlying
+    // data pointer inside the BoxChar. Since we are generating a new MapInfoOp
+    // for the privatized BoxChar, we do not check if the underlying pointer has
+    // already been mapped.
+    if (mlir::isa<fir::BoxCharType>(varPtr.getType())) {
+      // We need to map the !fir.char<k> wrapped by the !fir.boxchar<k>
+      // Step 1. From !fir.boxchar, get the !fir.ref<fir.char<k>
+      fir::BoxCharType boxType = mlir::cast<fir::BoxCharType>(varPtr.getType());
+      mlir::Type refType = builder.getRefType(boxType.getEleTy());
+      mlir::Type lenType = builder.getCharacterLengthType();
+      auto unboxed = builder.create<fir::UnboxCharOp>(loc, refType, lenType, varPtr);
+      mlir::Value charRef = unboxed.getResult(0);
+
+      // Step 2. Create the MapInfoOp to map charRef.
+      mlir::omp::MapInfoOp mapInfoForCharRef = builder.create<omp::MapInfoOp>(
+          loc, charRef.getType(), charRef,
+          TypeAttr::get(llvm::cast<omp::PointerLikeType>(charRef.getType())
+                            .getElementType()),
+          builder.getIntegerAttr(builder.getIntegerType(64, /*isSigned=*/false),
+                                 mapTypeTo),
+          builder.getAttr<omp::VariableCaptureKindAttr>(
+              omp::VariableCaptureKind::ByRef),
+          /*varPtrPtr=*/Value{},
+          /*members=*/SmallVector<Value>{},
+          /*member_index=*/mlir::ArrayAttr{},
+          /*bounds=*/ValueRange{},
+          /*mapperId=*/mlir::FlatSymbolRefAttr(), /*name=*/StringAttr(),
+          builder.getBoolAttr(false));
+      mapInfoOps.push_back(mapInfoForCharRef);
+      numMapsGenerated += 1;
+      LLVM_DEBUG(PDBGS() << "createMap for charRef: " << mapInfoForCharRef
+                 << "\n");
+    }
     // If we do not have a reference to a descriptor but the descriptor itself,
     // then we need to store that on the stack so that we can map the
     // address of the descriptor.
@@ -92,7 +128,7 @@ class MapsForPrivatizedSymbolsPass
     if (needsBoundsOps(varPtr))
       genBoundsOps(builder, varPtr, boundsOps);
 
-    return builder.create<omp::MapInfoOp>(
+    mlir::omp::MapInfoOp mapInfoOp =  builder.create<omp::MapInfoOp>(
         loc, varPtr.getType(), varPtr,
         TypeAttr::get(llvm::cast<omp::PointerLikeType>(varPtr.getType())
                           .getElementType()),
@@ -106,6 +142,11 @@ class MapsForPrivatizedSymbolsPass
         /*bounds=*/boundsOps.empty() ? SmallVector<Value>{} : boundsOps,
         /*mapperId=*/mlir::FlatSymbolRefAttr(), /*name=*/StringAttr(),
         builder.getBoolAttr(false));
+    mapInfoOps.push_back(mapInfoOp);
+    numMapsGenerated += 1;
+    LLVM_DEBUG(PDBGS() << "MapsForPrivatizedSymbolsPass created ->\n"
+               << mapInfoOp << "\n");
+    return numMapsGenerated;
   }
   void addMapInfoOp(omp::TargetOp targetOp, omp::MapInfoOp mapInfoOp) {
     auto argIface = llvm::cast<omp::BlockArgOpenMPOpInterface>(*targetOp);
@@ -146,16 +187,14 @@ class MapsForPrivatizedSymbolsPass
           continue;
         }
 
-        privVarMapIdx.push_back(targetOp.getMapVars().size() +
-                                mapInfoOps.size());
-
+        int numMapInfosAlready = targetOp.getMapVars().size() +
+                                     mapInfoOps.size();
         builder.setInsertionPoint(targetOp);
         Location loc = targetOp.getLoc();
-        omp::MapInfoOp mapInfoOp = createMapInfo(loc, privVar, builder);
-        mapInfoOps.push_back(mapInfoOp);
+        int numMapInfosAdded = createMapInfo(loc, privVar, builder, mapInfoOps);
+        privVarMapIdx.push_back(numMapInfosAlready + numMapInfosAdded - 1);
 
-        LLVM_DEBUG(PDBGS() << "MapsForPrivatizedSymbolsPass created ->\n"
-                           << mapInfoOp << "\n");
+
       }
       if (!mapInfoOps.empty()) {
         mapInfoOpsForTarget.insert({targetOp.getOperation(), mapInfoOps});
@@ -188,30 +227,49 @@ class MapsForPrivatizedSymbolsPass
     if (!fir::isBoxAddress(var.getType()))
       return;
 
-    unsigned int rank = 0;
-    rank = fir::getBoxRank(fir::unwrapRefType(var.getType()));
     mlir::Location loc = var.getLoc();
     mlir::Type idxTy = builder.getIndexType();
+    mlir::Value zero = builder.createIntegerConstant(loc, idxTy, 0);
     mlir::Value one = builder.createIntegerConstant(loc, idxTy, 1);
     mlir::Type boundTy = builder.getType<omp::MapBoundsType>();
     mlir::Value box = builder.create<fir::LoadOp>(loc, var);
-    for (unsigned int i = 0; i < rank; ++i) {
-      mlir::Value dimNo = builder.createIntegerConstant(loc, idxTy, i);
-      auto dimInfo =
-          builder.create<fir::BoxDimsOp>(loc, idxTy, idxTy, idxTy, box, dimNo);
-      auto normalizedLB = builder.create<mlir::arith::ConstantOp>(
-          loc, idxTy, builder.getIntegerAttr(idxTy, 0));
-      mlir::Value lb = dimInfo.getLowerBound();
-      mlir::Value extent = dimInfo.getExtent();
-      mlir::Value byteStride = dimInfo.getByteStride();
-      mlir::Value ub = builder.create<mlir::arith::SubIOp>(loc, extent, one);
+    unsigned int rank = 0;
+    rank = fir::getBoxRank(fir::unwrapRefType(var.getType()));
 
-      mlir::Value boundsOp = builder.create<omp::MapBoundsOp>(
-          loc, boundTy, /*lower_bound=*/normalizedLB,
-          /*upper_bound=*/ub, /*extent=*/extent, /*stride=*/byteStride,
-          /*stride_in_bytes = */ true, /*start_idx=*/lb);
+    auto genBoundsOp = [&](mlir::Value lb, mlir::Value extent, mlir::Value stride, mlir::Value start_idx) -> mlir::omp::MapBoundsOp {
+      mlir::Value ub = builder.create<mlir::arith::SubIOp>(loc, extent, one);
+      return builder.create<omp::MapBoundsOp>(
+          loc, boundTy, /*lower_bound=*/lb,
+          /*upper_bound=*/ub, /*extent=*/extent, /*stride=*/stride,
+          /*stride_in_bytes = */ true, /*start_idx=*/start_idx);
+    };
+    if (rank == 0) {
+      // What else can have rank 0? If nothing else can, then shouldn't we
+      // assert instead of return?
+      if (!fir::factory::CharacterExprHelper::isCharacterScalar(var.getType()))
+        return;
+      LLVM_DEBUG(PDBGS() << "is Character\n");
+      mlir::Value extent =
+          fir::factory::CharacterExprHelper{builder, loc}.readLengthFromBox(
+              box);
+      mlir::Value boundsOp =
+          genBoundsOp(zero, extent, /*stride=*/one, /*start_idx=*/zero);
       LLVM_DEBUG(PDBGS() << "Created BoundsOp " << boundsOp << "\n");
       boundsOps.push_back(boundsOp);
+    } else {
+      for (unsigned int i = 0; i < rank; ++i) {
+        mlir::Value dimNo = builder.createIntegerConstant(loc, idxTy, i);
+        auto dimInfo = builder.create<fir::BoxDimsOp>(loc, idxTy, idxTy, idxTy,
+                                                      box, dimNo);
+        auto normalizedLB = builder.create<mlir::arith::ConstantOp>(
+            loc, idxTy, builder.getIntegerAttr(idxTy, 0));
+
+        mlir::Value boundsOp =
+            genBoundsOp(normalizedLB, dimInfo.getExtent(),
+                        dimInfo.getByteStride(), dimInfo.getLowerBound());
+        LLVM_DEBUG(PDBGS() << "Created BoundsOp " << boundsOp << "\n");
+        boundsOps.push_back(boundsOp);
+      }
     }
   }
 };
