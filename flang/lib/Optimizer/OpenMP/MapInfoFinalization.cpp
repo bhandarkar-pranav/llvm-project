@@ -42,11 +42,14 @@
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
+#include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <cstddef>
 #include <iterator>
 #include <numeric>
 
+#define DEBUG_TYPE "flang-map-info-finalization"
+#define PDBGS() (llvm::dbgs() << "[" << DEBUG_TYPE << "]: " << __func__ << ": ")
 namespace flangomp {
 #define GEN_PASS_DEF_MAPINFOFINALIZATIONPASS
 #include "flang/Optimizer/OpenMP/Passes.h.inc"
@@ -546,18 +549,21 @@ class MapInfoFinalizationPass
       // with an underlying type of fir.char<k, ?>, i.e a character
       // with dynamic length. If so, check if they need bounds added.
       func->walk([&](mlir::omp::MapInfoOp op) {
+        if (!op.getBounds().empty())
+          return mlir::WalkResult::advance();
+
         mlir::Value varPtr = op.getVarPtr();
+
         mlir::Type underlyingVarType = fir::unwrapRefType(varPtr.getType());
         if (!mlir::isa<fir::CharacterType>(underlyingVarType))
           return mlir::WalkResult::advance();
 
         fir::CharacterType cType =
             mlir::cast<fir::CharacterType>(underlyingVarType);
+
         if (!cType.hasDynamicLen())
           return mlir::WalkResult::advance();
 
-        if (!op.getBounds().empty())
-          return mlir::WalkResult::advance();
         // This means varPtr is a BlockArgument. I do not know how to get to a
         // fir.boxchar<> type of mlir::Value for varPtr. So, skipping this for
         // now.
@@ -568,7 +574,6 @@ class MapInfoFinalizationPass
         if (auto declOp = mlir::dyn_cast<hlfir::DeclareOp>(definingOp)) {
           mlir::Value base = declOp.getBase();
           assert(mlir::isa<fir::BoxCharType>(base.getType()));
-          //          mlir::value unboxChar
           builder.setInsertionPoint(op);
           fir::BoxCharType boxCharType =
               mlir::cast<fir::BoxCharType>(base.getType());
@@ -578,10 +583,25 @@ class MapInfoFinalizationPass
           mlir::Location location = op.getLoc();
           auto unboxed = builder.create<fir::UnboxCharOp>(location, refType,
                                                           lenType, base);
-          //          len = unboxed.getResult(1);
           mlir::Value zero = builder.createIntegerConstant(location, idxTy, 0);
           mlir::Value one = builder.createIntegerConstant(location, idxTy, 1);
           mlir::Value extent = unboxed.getResult(1);
+          mlir::Value stride = one;
+          mlir::Value ub =
+              builder.create<mlir::arith::SubIOp>(location, extent, one);
+          mlir::Type boundTy = builder.getType<mlir::omp::MapBoundsType>();
+          mlir::Value boundsOp = builder.create<mlir::omp::MapBoundsOp>(
+              location, boundTy, /*lower_bound=*/zero,
+              /*upper_bound=*/ub, /*extent=*/extent, /*stride=*/stride,
+              /*stride_in_bytes = */ true, /*start_idx=*/zero);
+          op.getBoundsMutable().append({boundsOp});
+        } else if (auto unBoxCharOp = mlir::dyn_cast<fir::UnboxCharOp>(definingOp)) {
+          builder.setInsertionPoint(op);
+          mlir::Type idxTy = builder.getIndexType();
+          mlir::Location location = op.getLoc();
+          mlir::Value zero = builder.createIntegerConstant(location, idxTy, 0);
+          mlir::Value one = builder.createIntegerConstant(location, idxTy, 1);
+          mlir::Value extent = unBoxCharOp.getResult(1);
           mlir::Value stride = one;
           mlir::Value ub =
               builder.create<mlir::arith::SubIOp>(location, extent, one);
