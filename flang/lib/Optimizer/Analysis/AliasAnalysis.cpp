@@ -687,12 +687,14 @@ AliasResult AliasAnalysis::alias(Source lhsSrc, Source rhsSrc, mlir::Value lhs,
 
   if (lhsArg && rhsArg &&
       lhsArg.getParentRegion() == rhsArg.getParentRegion()) {
+guments)
     if (auto *parentOp = lhsArg.getParentRegion()->getParentOp()) {
       if (auto privateOp = mlir::dyn_cast<omp::PrivateClauseOp>(parentOp)) {
         auto &copyRegion = privateOp.getCopyRegion();
         if (lhsArg.getParentRegion() == &copyRegion) {
           // Both trace to block args from the copy region - check if they're
           // the defined pair
+guments)
           auto moldArg = privateOp.getCopyMoldArg();
           auto privArg = privateOp.getCopyPrivateArg();
           if ((lhsArg == moldArg && rhsArg == privArg) ||
@@ -716,7 +718,6 @@ AliasResult AliasAnalysis::alias(Source lhsSrc, Source rhsSrc, mlir::Value lhs,
                          << "association (data aliases)\n");
               return AliasResult::MayAlias;
             }
-
             LLVM_DEBUG(llvm::dbgs()
                        << "  no alias: omp.private copy region arguments "
                        << "(mold vs private)\n");
