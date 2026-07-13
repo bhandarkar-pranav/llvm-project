@@ -559,7 +559,7 @@ AliasResult AliasAnalysis::alias(Source lhsSrc, Source rhsSrc, mlir::Value lhs,
   // allocated memory (from the init region), while %arg0 references the
   // original variable. These cannot alias. This check handles both direct block
   // argument comparisons and cases where one value is loaded from a block
-  // argument (common pattern: hlfir.assign %loaded to %arg where %loaded =
+  // argument (common pattern: hlfir.assign %loaded to %arg1 where %loaded =
   // fir.load %arg0).
   auto getBlockArgOrLoadSource = [](mlir::Value v) -> mlir::BlockArgument {
     if (auto arg = mlir::dyn_cast<BlockArgument>(v))
