@@ -697,6 +697,26 @@ AliasResult AliasAnalysis::alias(Source lhsSrc, Source rhsSrc, mlir::Value lhs,
           auto privArg = privateOp.getCopyPrivateArg();
           if ((lhsArg == moldArg && rhsArg == privArg) ||
               (lhsArg == privArg && rhsArg == moldArg)) {
+            // Check if this is a POINTER type.
+            // For POINTER + FIRSTPRIVATE: the descriptor is copied (private)
+            // but pointer association is preserved, so the DATA they point to
+            // is the same → ALIASING.
+            // For ALLOCATABLE: fresh memory is allocated → NO ALIASING.
+            auto isPointerType = [](mlir::Type ty) -> bool {
+              ty = fir::unwrapRefType(ty);
+              if (auto boxTy = mlir::dyn_cast<fir::BaseBoxType>(ty))
+                return boxTy.isPointer();
+              return false;
+            };
+
+            if (isPointerType(lhsArg.getType()) ||
+                isPointerType(rhsArg.getType())) {
+              LLVM_DEBUG(llvm::dbgs()
+                         << "  may alias: omp.private POINTER preserves "
+                         << "association (data aliases)\n");
+              return AliasResult::MayAlias;
+            }
+
             LLVM_DEBUG(llvm::dbgs()
                        << "  no alias: omp.private copy region arguments "
                        << "(mold vs private)\n");
