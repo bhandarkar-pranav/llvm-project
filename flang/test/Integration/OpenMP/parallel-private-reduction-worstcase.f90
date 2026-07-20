@@ -148,7 +148,7 @@ end subroutine
 ! CHECK:       omp.par.region47:                                 ; preds = %omp.par.region45
 ! CHECK-NEXT:    br label %omp.region.cont44
 
-! CHECK:       omp.region.cont44:                                ; preds = %omp.par.region46, %omp.par.region47
+! CHECK:       omp.region.cont44:                                ; preds = %omp.par.region47
 !                [omp parallel region done, call into the runtime to complete reduction]
 ! CHECK:         %[[VAL_233:.*]] = call i32 @__kmpc_reduce(
 ! CHECK:         switch i32 %[[VAL_233]], label %reduce.finalize [
