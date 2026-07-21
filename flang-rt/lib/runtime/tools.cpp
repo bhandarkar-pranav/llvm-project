@@ -201,13 +201,6 @@ RT_API_ATTRS void ShallowCopyInner(const Descriptor &to, const Descriptor &from,
   }
 }
 
-// Specialize only for common ranks (1-4) to reduce code size.
-// Higher ranks use the generic fallback which handles any rank at runtime.
-// Most real-world Fortran arrays are rank 1-3; rank 4+ is rare.
-// This trades a small amount of potential optimization for high-rank arrays
-// in exchange for significantly reduced code size (~60% reduction in
-// ShallowCopy template instantiations).
-
 // ShallowCopy helper for specialising the variants based on array rank
 template <typename P>
 RT_API_ATTRS void ShallowCopyRank(const Descriptor &to, const Descriptor &from,
@@ -228,7 +221,12 @@ RT_API_ATTRS void ShallowCopyRank(const Descriptor &to, const Descriptor &from,
     return;
   default:
     // Generic fallback for rank > 4 (and rank 0, though that's handled
-    // by the contiguous-to-contiguous case in ShallowCopyInner)
+    // by the contiguous-to-contiguous case in ShallowCopyInner).
+    // We limit rank specializations to 1-4 to balance compile-time cost
+    // against runtime performance. Specializing higher ranks would create
+    // many additional template instantiations, significantly increasing
+    // compile time with minimal benefit since ranks 1-4 cover the vast
+    // majority of real-world Fortran code.
     ShallowCopyInner<P>(to, from, toIsContiguous, fromIsContiguous);
     return;
   }
