@@ -860,7 +860,6 @@ void RTDEF(AssignSimple)(Descriptor &to, const Descriptor &from,
   //   - LHS element type is trivial (isa_trivial), not derived/polymorphic
   //   - LHS and RHS ranks match (no scalar-to-array broadcasting)
   //   - LHS is not volatile (volatile needs memory ordering semantics)
-  // See ConvertToFIR.cpp for the compile-time routing decisions.
 
   if (to.rank() != from.rank()) {
     terminator.Crash("AssignSimple: rank mismatch (to.rank=%d, from.rank=%d)",
@@ -880,18 +879,19 @@ void RTDEF(AssignSimple)(Descriptor &to, const Descriptor &from,
   std::size_t elements{from.Elements()};
 
   // Conformability check for non-allocatable arrays.
-  // For allocatable LHS, shape mismatch triggers reallocation (handled in
-  // Step 2 below). For non-allocatable LHS, shape mismatch is an error
-  // per Fortran 2018 10.2.1.2 -- the shapes must conform.
-  // This matches the conformability check in AssignTicket::Begin().
+  // 1. For allocatable LHS, shape mismatch triggers reallocation (handled in
+  //    Step 2 below).
+  // 2. For non-allocatable LHS, shape mismatch is an error per Fortran
+  //    2018 10.2.1.2 -- the shapes must conform. This matches the
+  //    conformability check in AssignTicket::Begin().
   //
-  // Example: x(8:1:-3) = x(5:2:-2) where LHS has 3 elements, RHS has 2.
-  // This should produce a runtime error when bounds checking is enabled.
+  // Example: x(8:1:-3) = x(5:2:-2) where x is not allocatable and LHS has 3
+  // elements, RHS has 2.
   if (!to.IsAllocatable() && from.rank() > 0) {
     std::size_t toElements{to.Elements()};
     if (toElements != elements) {
       terminator.Crash("AssignSimple: mismatching element counts in "
-                       "array assignment (to %zd, from %zd)",
+                       "non-allocatable array assignment (to %zd, from %zd)",
           toElements, elements);
     }
   }
@@ -936,16 +936,22 @@ void RTDEF(AssignSimple)(Descriptor &to, const Descriptor &from,
   //            a = a(1:3)  ! shapes differ -> deallocate a -> frees a(1:3)'s
   //            data
   //
-  // TODO: For better performance on contiguous aliased assignments that do not
+  // TODO: Refining the condition for creating a temporary buffer.
+  // For better performance on contiguous aliased assignments that do not
   // require reallocation, we could refine the condition to only create a temp
-  // when: (needsReallocation || !to.IsContiguous() || !from.IsContiguous()).
-  // Since aliasing is rare in practice, the current simpler approach has
-  // negligible overhead.
+  // when:
+  // (needsReallocation || !to.IsContiguous() || !from.IsContiguous())
+  // where
+  // needsReallocation = (to.isAllocatable() && (!to.isAllocated ||
+  //                                             shape_mismatch))
+  // For needsReallocation, see Step 2 below.
+  // Right now though, the simpler approach of always creating a temporary
+  // when aliasing is detected is fine.
   //
   // The temporary buffer is allocated via AllocateMemoryOrCrash(), which is
   // a thin wrapper around std::malloc. This is GPU-safe: both
   // AllocateMemoryOrCrash and std::malloc are available in GPU device code
-  // (via the device-side heap allocator), and AssignSimple already calls
+  // (via the device-side heap allocator), and Assign already calls
   // Descriptor::Allocate() which goes through the same std::malloc path.
   char *tempBuffer{nullptr};
   if (MayAlias(to, from)) {
@@ -970,10 +976,11 @@ void RTDEF(AssignSimple)(Descriptor &to, const Descriptor &from,
 
   // Step 2: Handle allocation/reallocation for allocatable LHS.
   //
-  // This must come AFTER the aliasing check above. If LHS and RHS alias
-  // and shapes differ, the Deallocate() call below would free the memory
-  // that the RHS points to. The temporary created in Step 1 preserves
-  // the RHS data, making the deallocation safe.
+  // This must come AFTER the aliasing check above. That is because if we
+  // must call deallocate the LHS (If LHS and RHS alias and shapes differ), the
+  // Deallocate() call below would free the memory that the RHS points to. The
+  // temporary created in Step 1 preserves the RHS data, making the deallocation
+  // safe.
   //
   // Per Fortran 2018 10.2.1.3(3): for allocatable LHS, if the LHS is
   // already allocated and shapes differ, it must be deallocated and
