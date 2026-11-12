@@ -245,9 +245,10 @@ struct LocalInitCopyInfo {
   /// original (e.g., load from original, store to private).
   fir::LocalitySpecifierOp localizer;
 
-  /// The host (original) variable that the copy reads from. On the host path,
-  /// this is the raw SSA value from the function scope. On the device path,
-  /// this is the device-mapped value obtained via mapper.lookup().
+  /// The host (original) variable that the copy reads from. When the loop is
+  /// not moved into a new target region (`remapsLiveIns` is false), this is
+  /// the raw SSA value from the enclosing scope. Otherwise it is the
+  /// device-mapped value obtained via mapper.lookup().
   mlir::Value originalVar;
 
   /// Index into the privateClauseOps.privateVars list. After genEntryBlock()
@@ -333,6 +334,93 @@ static bool isIntConstant(mlir::Value value) {
   while (auto convertOp = value.getDefiningOp<fir::ConvertOp>())
     value = convertOp.getValue();
   return fir::getIntIfConstant(value).has_value();
+}
+
+/// Describes *what* the pattern emits for one particular `do concurrent` loop.
+///
+/// The `-fdo-concurrent-to-openmp=host|device` option only states the user's
+/// request (stored in `DoConcurrentConversion::mapToDevice`). Which OpenMP
+/// construct nest is actually generated for a given loop is a separate,
+/// per-loop decision, made once at the start of `matchAndRewrite` by
+/// `DoConcurrentConversion::computeEmissionContext` and then threaded through
+/// all the `gen*` helpers.
+///
+/// Keeping the request and the decision apart lets later changes emit
+/// different nests for loops in different surroundings (for example a loop
+/// that is already inside an `omp.target` region) without re-testing the raw
+/// option in every helper. Today the mapping is one-to-one:
+///
+///   -fdo-concurrent-to-openmp=host   -> EmissionContext::Host
+///   -fdo-concurrent-to-openmp=device -> EmissionContext::NewDeviceTarget
+///
+/// The helpers below (`createsTargetRegion`, `privatizesOnParallel`, ...) are
+/// the only places that interpret a context value. The generation code asks
+/// these questions instead of switching on the context directly, so adding a
+/// context only requires answering each question for it.
+enum class EmissionContext {
+  /// Parallelize on the host CPU. Generates (simplified):
+  ///
+  ///   omp.parallel {                       // omp.combined
+  ///     omp.wsloop private(...) reduction(...) {
+  ///       omp.loop_nest (...) { ... }
+  ///     }
+  ///   }
+  ///
+  /// Live-ins are used directly: `omp.parallel` is not IsolatedFromAbove, so
+  /// host values remain visible inside the region (i.e. they are shared).
+  Host,
+
+  /// Offload to a device with a *new* target region created by the pass.
+  /// Generates (simplified):
+  ///
+  ///   omp.target host_eval(lb, ub, step) map_entries(live-ins...) {
+  ///     omp.teams reduction(...) {         // target and teams: omp.combined
+  ///       omp.parallel private(...) {      // omp.composite
+  ///         omp.distribute {               // omp.composite
+  ///           omp.wsloop reduction(...) {  // omp.composite
+  ///             omp.loop_nest (...) { ... }
+  ///   } } } } }
+  ///
+  /// `omp.target` is IsolatedFromAbove, so every live-in is mapped through an
+  /// `omp.map.info` op and host values are remapped (via an `IRMapping`) to the
+  /// corresponding target block arguments.
+  NewDeviceTarget,
+};
+
+/// Returns true if the pass creates a new `omp.target` region for the loop.
+/// This also implies mapping live-ins with `omp.map.info` ops and evaluating
+/// the loop bounds on the host (`host_eval`).
+static bool createsTargetRegion(EmissionContext ctx) {
+  return ctx == EmissionContext::NewDeviceTarget;
+}
+
+/// Returns true if host-side SSA values used by the loop must be looked up in
+/// the host-to-device `IRMapping` before being used as clause operands (e.g.
+/// privatized or reduced variables). This is the case exactly when the loop
+/// is moved into a new, IsolatedFromAbove `omp.target` region.
+static bool remapsLiveIns(EmissionContext ctx) {
+  return createsTargetRegion(ctx);
+}
+
+/// Returns true if the generated nest distributes iterations across teams,
+/// i.e. it contains `omp.teams` and `omp.distribute`. In that case
+/// `omp.parallel`, `omp.distribute` and `omp.wsloop` together form the
+/// composite `distribute parallel do` construct and are marked
+/// `omp.composite`; otherwise `omp.parallel` + `omp.wsloop` form the combined
+/// `parallel do` construct and `omp.parallel` is marked `omp.combined`.
+static bool distributesAcrossTeams(EmissionContext ctx) {
+  return ctx == EmissionContext::NewDeviceTarget;
+}
+
+/// Returns true if `private` clauses (for LOCAL / LOCAL_INIT variables) are
+/// attached to `omp.parallel`, false if they are attached to `omp.wsloop`.
+///
+/// In a `distribute parallel do` composite nest, `omp.distribute` sits between
+/// `omp.parallel` and `omp.wsloop`, and the privatized storage must be
+/// allocated per thread by the parallel region that encloses both of them.
+/// In a plain `parallel do` nest the worksharing loop owns the privates.
+static bool privatizesOnParallel(EmissionContext ctx) {
+  return distributesAcrossTeams(ctx);
 }
 
 class DoConcurrentConversion
@@ -426,12 +514,17 @@ public:
                                           }),
                           loopNestLiveIns.end());
 
+    // Decide once, for this particular loop, which construct nest to emit.
+    // Everything below asks questions about `ctx` (see the helpers next to
+    // `EmissionContext`) instead of testing the raw `mapToDevice` option.
+    const EmissionContext ctx = computeEmissionContext(doLoop);
+
     mlir::omp::TargetOp targetOp;
     mlir::omp::LoopNestOperands loopNestClauseOps;
 
     mlir::IRMapping mapper;
 
-    if (mapToDevice) {
+    if (createsTargetRegion(ctx)) {
       mlir::ModuleOp module = doLoop->getParentOfType<mlir::ModuleOp>();
       bool isTargetDevice =
           llvm::cast<mlir::omp::OffloadModuleInterface>(*module)
@@ -460,43 +553,48 @@ public:
       targetOp =
           genTargetOp(doLoop.getLoc(), rewriter, mapper, loopNestLiveIns,
                       targetClauseOps, loopNestClauseOps, liveInShapeInfoMap);
-      auto teamsOp = genTeamsOp(rewriter, loop, mapper);
+      auto teamsOp = genTeamsOp(rewriter, loop, mapper, ctx);
       targetOp.setCombined(true);
       teamsOp.setCombined(true);
     }
 
     // Collects info about LOCAL_INIT variables that need per-iteration copy
-    // inlining. Populated by genPrivatizers() (called from genParallelOp on the
-    // device path, or from genWsLoopOp on the host path). Consumed below after
-    // block arg remapping to inline the copy_region into omp.loop_nest.
+    // inlining. Populated by genPrivatizers(), which is called from
+    // genParallelOp or from genWsLoopOp depending on `privatizesOnParallel`.
+    // Consumed below after block arg remapping to inline the copy_region into
+    // omp.loop_nest.
     llvm::SmallVector<looputils::LocalInitCopyInfo> localInitCopies;
 
     mlir::omp::ParallelOp parallelOp =
-        genParallelOp(rewriter, loop, ivInfos, mapper, localInitCopies);
+        genParallelOp(rewriter, loop, ivInfos, mapper, localInitCopies, ctx);
 
     // Only set as composite when part of `distribute parallel do`, and only set
     // as combined when part of `parallel do`.
-    parallelOp.setComposite(mapToDevice);
-    parallelOp.setCombined(!mapToDevice);
+    parallelOp.setComposite(distributesAcrossTeams(ctx));
+    parallelOp.setCombined(!distributesAcrossTeams(ctx));
 
-    if (!mapToDevice)
+    // When a new target region is created, the loop nest clause operands were
+    // already generated above (their bounds must be host-evaluated and remapped
+    // into the target region). Otherwise generate them here, in place.
+    if (!createsTargetRegion(ctx))
       genLoopNestClauseOps(doLoop.getLoc(), rewriter, loop, loopNestClauseOps);
 
     for (mlir::Value local : locals)
       looputils::localizeLoopLocalValue(local, parallelOp.getRegion(),
                                         rewriter);
 
-    if (mapToDevice)
+    if (distributesAcrossTeams(ctx))
       genDistributeOp(doLoop.getLoc(), rewriter).setComposite(/*val=*/true);
 
-    auto [loopNestOp, wsLoopOp] =
-        genWsLoopOp(rewriter, loop, mapper, loopNestClauseOps,
-                    /*isComposite=*/mapToDevice, localInitCopies);
+    auto [loopNestOp, wsLoopOp] = genWsLoopOp(
+        rewriter, loop, mapper, loopNestClauseOps, localInitCopies, ctx);
 
     // `local` region arguments are transferred/cloned from the `do concurrent`
     // loop to the loopnest op when the region is cloned above. Instead, these
-    // region arguments should be on the workshare loop's region.
-    if (mapToDevice) {
+    // region arguments should be on the op that owns the corresponding clause:
+    //   - privates:   omp.parallel (privatizesOnParallel) or omp.wsloop;
+    //   - reductions: omp.wsloop in both cases.
+    if (privatizesOnParallel(ctx)) {
       for (auto [parallelArg, loopNestArg] : llvm::zip_equal(
                parallelOp.getRegion().getArguments(),
                loopNestOp.getRegion().getArguments().slice(
@@ -539,8 +637,9 @@ public:
     //   }
     if (!localInitCopies.empty()) {
       for (auto &info : localInitCopies) {
-        // Resolve the private block arg. On the device path, privates are on
-        // omp.parallel; on the host path, they are on omp.wsloop.
+        // Resolve the private block arg. Privates are on omp.parallel when
+        // `privatizesOnParallel(ctx)` holds (distribute parallel do nest), and
+        // on omp.wsloop otherwise (parallel do nest).
         //
         // We use BlockArgOpenMPOpInterface::getPrivateBlockArgs() rather than
         // raw getRegion().getArgument(idx) because the block arg layout
@@ -549,8 +648,9 @@ public:
         // Using getPrivateBlockArgs() correctly accounts for any preceding
         // clause block args, making the indexing robust if new clause types
         // are added to the op in the future.
-        mlir::Operation *privArgOwner =
-            mapToDevice ? parallelOp.getOperation() : wsLoopOp.getOperation();
+        mlir::Operation *privArgOwner = privatizesOnParallel(ctx)
+                                            ? parallelOp.getOperation()
+                                            : wsLoopOp.getOperation();
         auto blockArgIface =
             mlir::cast<mlir::omp::BlockArgOpenMPOpInterface>(privArgOwner);
         mlir::Value privateBlockArg =
@@ -596,15 +696,16 @@ private:
   mlir::omp::ParallelOp genParallelOp(
       mlir::ConversionPatternRewriter &rewriter, fir::DoConcurrentLoopOp loop,
       looputils::InductionVariableInfos &ivInfos, mlir::IRMapping &mapper,
-      llvm::SmallVectorImpl<looputils::LocalInitCopyInfo> &localInitCopies)
-      const {
+      llvm::SmallVectorImpl<looputils::LocalInitCopyInfo> &localInitCopies,
+      EmissionContext ctx) const {
     mlir::omp::ParallelOperands parallelOps;
 
-    // On the device path, private variables are attached to omp.parallel
-    // (not omp.wsloop). genPrivatizers populates localInitCopies for any
-    // LOCAL_INIT variables encountered.
-    if (mapToDevice)
-      genPrivatizers(rewriter, mapper, loop, parallelOps, localInitCopies);
+    // In a `distribute parallel do` nest, private variables are attached to
+    // omp.parallel (not omp.wsloop); see `privatizesOnParallel`.
+    // genPrivatizers populates localInitCopies for any LOCAL_INIT variables
+    // encountered.
+    if (privatizesOnParallel(ctx))
+      genPrivatizers(rewriter, mapper, loop, parallelOps, localInitCopies, ctx);
 
     mlir::Location loc = loop.getLoc();
     auto parallelOp = mlir::omp::ParallelOp::create(rewriter, loc, parallelOps);
@@ -681,24 +782,27 @@ private:
         rewriter.getI64IntegerAttr(loopNestClauseOps.loopLowerBounds.size());
   }
 
-  std::pair<mlir::omp::LoopNestOp, mlir::omp::WsloopOp>
-  genWsLoopOp(mlir::ConversionPatternRewriter &rewriter,
-              fir::DoConcurrentLoopOp loop, mlir::IRMapping &mapper,
-              const mlir::omp::LoopNestOperands &clauseOps, bool isComposite,
-              llvm::SmallVectorImpl<looputils::LocalInitCopyInfo>
-                  &localInitCopies) const {
+  std::pair<mlir::omp::LoopNestOp, mlir::omp::WsloopOp> genWsLoopOp(
+      mlir::ConversionPatternRewriter &rewriter, fir::DoConcurrentLoopOp loop,
+      mlir::IRMapping &mapper, const mlir::omp::LoopNestOperands &clauseOps,
+      llvm::SmallVectorImpl<looputils::LocalInitCopyInfo> &localInitCopies,
+      EmissionContext ctx) const {
     mlir::omp::WsloopOperands wsloopClauseOps;
-    // On the host path, private variables are attached to omp.wsloop
-    // (not omp.parallel). genPrivatizers populates localInitCopies for any
-    // LOCAL_INIT variables encountered.
-    if (!mapToDevice)
-      genPrivatizers(rewriter, mapper, loop, wsloopClauseOps, localInitCopies);
+    // In a plain `parallel do` nest, private variables are attached to
+    // omp.wsloop (not omp.parallel); see `privatizesOnParallel`.
+    // genPrivatizers populates localInitCopies for any LOCAL_INIT variables
+    // encountered.
+    if (!privatizesOnParallel(ctx))
+      genPrivatizers(rewriter, mapper, loop, wsloopClauseOps, localInitCopies,
+                     ctx);
 
-    genReductions(rewriter, mapper, loop, wsloopClauseOps);
+    genReductions(rewriter, mapper, loop, wsloopClauseOps, ctx);
 
     auto wsloopOp =
         mlir::omp::WsloopOp::create(rewriter, loop.getLoc(), wsloopClauseOps);
-    wsloopOp.setComposite(isComposite);
+    // The worksharing loop is part of the composite `distribute parallel do`
+    // construct exactly when iterations are also distributed across teams.
+    wsloopOp.setComposite(distributesAcrossTeams(ctx));
 
     Fortran::common::openmp::EntryBlockArgs wsloopArgs;
     wsloopArgs.privVars = wsloopClauseOps.privateVars;
@@ -999,9 +1103,10 @@ private:
 
   mlir::omp::TeamsOp genTeamsOp(mlir::ConversionPatternRewriter &rewriter,
                                 fir::DoConcurrentLoopOp loop,
-                                mlir::IRMapping &mapper) const {
+                                mlir::IRMapping &mapper,
+                                EmissionContext ctx) const {
     mlir::omp::TeamsOperands teamsOps;
-    genReductions(rewriter, mapper, loop, teamsOps);
+    genReductions(rewriter, mapper, loop, teamsOps, ctx);
 
     mlir::Location loc = loop.getLoc();
     auto teamsOp = mlir::omp::TeamsOp::create(rewriter, loc, teamsOps);
@@ -1063,11 +1168,14 @@ private:
   /// \param [out] localInitCopies - info for LOCAL_INIT variables that need
   ///   per-iteration copy inlining. Populated here, consumed after block arg
   ///   remapping in matchAndRewrite().
-  void genPrivatizers(mlir::ConversionPatternRewriter &rewriter,
-                      mlir::IRMapping &mapper, fir::DoConcurrentLoopOp loop,
-                      mlir::omp::PrivateClauseOps &privateClauseOps,
-                      llvm::SmallVectorImpl<looputils::LocalInitCopyInfo>
-                          &localInitCopies) const {
+  /// \param [in] ctx - the emission context of the loop; decides whether
+  ///   \p loop's local variables must be remapped to device values.
+  void genPrivatizers(
+      mlir::ConversionPatternRewriter &rewriter, mlir::IRMapping &mapper,
+      fir::DoConcurrentLoopOp loop,
+      mlir::omp::PrivateClauseOps &privateClauseOps,
+      llvm::SmallVectorImpl<looputils::LocalInitCopyInfo> &localInitCopies,
+      EmissionContext ctx) const {
     // For `local` and `local_init` operands, emit corresponding `private`
     // clauses and attach these clauses to the workshare loop (host) or
     // parallel op (device).
@@ -1101,9 +1209,11 @@ private:
 
         moduleSymbolTable.insert(privatizer);
 
-        // On the device path, use the mapped (device-side) value. On the host
-        // path, use the raw value since omp.parallel is not IsolatedFromAbove.
-        mlir::Value actualVar = mapToDevice ? mapper.lookup(var) : var;
+        // When the loop was moved into a new (IsolatedFromAbove) target
+        // region, use the mapped (device-side) value. Otherwise use the raw
+        // value, which is still visible because omp.parallel is not
+        // IsolatedFromAbove.
+        mlir::Value actualVar = remapsLiveIns(ctx) ? mapper.lookup(var) : var;
         privateClauseOps.privateVars.push_back(actualVar);
         privateClauseOps.privateSyms.push_back(
             mlir::SymbolRefAttr::get(privatizer));
@@ -1124,9 +1234,15 @@ private:
     }
   }
 
+  /// Generate `omp.declare_reduction` ops for \p loop's `reduce` operands
+  /// (cloning the bodies of the corresponding `fir.declare_reduction` ops, or
+  /// reusing an already converted one) and append the reduction clause
+  /// operands to \p reductionClauseOps. \p ctx decides whether the reduced
+  /// variables must be remapped to device values first.
   void genReductions(mlir::ConversionPatternRewriter &rewriter,
                      mlir::IRMapping &mapper, fir::DoConcurrentLoopOp loop,
-                     mlir::omp::ReductionClauseOps &reductionClauseOps) const {
+                     mlir::omp::ReductionClauseOps &reductionClauseOps,
+                     EmissionContext ctx) const {
     if (!loop.getReduceVars().empty()) {
       for (auto [var, byRef, sym, arg] : llvm::zip_equal(
                loop.getReduceVars(), loop.getReduceByrefAttr().asArrayRef(),
@@ -1163,7 +1279,7 @@ private:
         }
 
         reductionClauseOps.reductionVars.push_back(
-            mapToDevice ? mapper.lookup(var) : var);
+            remapsLiveIns(ctx) ? mapper.lookup(var) : var);
         reductionClauseOps.reductionByref.push_back(byRef);
         reductionClauseOps.reductionSyms.push_back(
             mlir::SymbolRefAttr::get(ompReducer));
@@ -1171,6 +1287,23 @@ private:
     }
   }
 
+  /// Decide which construct nest to emit for \p doLoop (see
+  /// `EmissionContext`).
+  ///
+  /// This is the single place that interprets the user's
+  /// `-fdo-concurrent-to-openmp` request. For now the decision depends only on
+  /// that request; \p doLoop is taken so that the decision can later also
+  /// depend on where the loop is (for example, a loop that is already inside
+  /// an `omp.target` region must not get a nested target region).
+  EmissionContext
+  computeEmissionContext([[maybe_unused]] fir::DoConcurrentOp doLoop) const {
+    return mapToDevice ? EmissionContext::NewDeviceTarget
+                       : EmissionContext::Host;
+  }
+
+  /// The user's request: `-fdo-concurrent-to-openmp=device` (true) or `=host`
+  /// (false). Only read by `computeEmissionContext`; all code generation is
+  /// driven by the resulting `EmissionContext`.
   bool mapToDevice;
   llvm::DenseSet<fir::DoConcurrentOp> &concurrentLoopsToSkip;
   mlir::SymbolTable &moduleSymbolTable;
