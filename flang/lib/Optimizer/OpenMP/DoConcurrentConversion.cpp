@@ -353,10 +353,30 @@ static bool isIntConstant(mlir::Value value) {
 ///   -fdo-concurrent-to-openmp=host   -> EmissionContext::Host
 ///   -fdo-concurrent-to-openmp=device -> EmissionContext::NewDeviceTarget
 ///
-/// The helpers below (`createsTargetRegion`, `privatizesOnParallel`, ...) are
-/// the only places that interpret a context value. The generation code asks
-/// these questions instead of switching on the context directly, so adding a
-/// context only requires answering each question for it.
+/// A context value is never inspected directly by the code that builds the
+/// OpenMP ops. Instead, four predicate functions defined right after this enum
+/// each map a context to one boolean property of the nest to generate:
+///
+///   createsTargetRegion    - create a new omp.target (with map_entries for
+///                            the live-ins and host_eval loop bounds)?
+///   remapsLiveIns          - must host SSA values be replaced by their
+///                            device-side counterparts (via the IRMapping)
+///                            before being used as clause operands?
+///   distributesAcrossTeams - emit omp.teams + omp.distribute, making the nest
+///                            a composite `distribute parallel do`?
+///   privatizesOnParallel   - attach `private` clauses to omp.parallel
+///                            instead of omp.wsloop?
+///
+/// The code in `matchAndRewrite` and the `gen*` helpers only calls these
+/// predicates (e.g. `if (createsTargetRegion(ctx)) ...`). These four
+/// properties used to be implied together by the single `mapToDevice` flag;
+/// keeping them separate allows a context in which, for instance, teams are
+/// distributed but no new target region is created. Adding a new context
+/// therefore means adding an enumerator, returning it from
+/// `computeEmissionContext`, and defining the value of each of the four
+/// predicates for it. The op-building code only needs changes where it still
+/// ties two properties together (for example, omp.teams is currently created
+/// together with the new omp.target).
 enum class EmissionContext {
   /// Parallelize on the host CPU. Generates (simplified):
   ///
@@ -515,8 +535,11 @@ public:
                           loopNestLiveIns.end());
 
     // Decide once, for this particular loop, which construct nest to emit.
-    // Everything below asks questions about `ctx` (see the helpers next to
-    // `EmissionContext`) instead of testing the raw `mapToDevice` option.
+    // The code below never tests `ctx` (or the `mapToDevice` option) directly;
+    // it calls the predicates defined next to `EmissionContext`
+    // (createsTargetRegion, remapsLiveIns, distributesAcrossTeams,
+    // privatizesOnParallel), each of which derives one property of the nest
+    // from `ctx`.
     const EmissionContext ctx = computeEmissionContext(doLoop);
 
     mlir::omp::TargetOp targetOp;
