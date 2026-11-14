@@ -503,11 +503,12 @@ static bool privatizesOnParallel(EmissionContext ctx) {
   return distributesAcrossTeams(ctx);
 }
 
-/// Returns true if executing \p op once per team, instead of once, cannot be
-/// observed: \p op (including any ops nested in its regions) either has no
-/// memory effects, only reads memory, or only touches flang's
-/// `fir::DebuggingResource` (which is how `hlfir.declare` / `fir.declare`
-/// model their effect; declaring a variable allocates nothing at run time).
+/// Returns true if \p op can be executed once per team instead of once
+/// without changing the program's results: \p op (including any ops nested
+/// in its regions) either has no memory effects, only reads memory, or only
+/// touches flang's `fir::DebuggingResource` (which is how `hlfir.declare` /
+/// `fir.declare` model their effect; declaring a variable allocates nothing
+/// at run time).
 ///
 /// Anything that writes, allocates or frees real memory (e.g. `fir.store`,
 /// `fir.alloca`, `hlfir.assign`), and any op whose effects are unknown (e.g. a
@@ -994,11 +995,12 @@ private:
   /// down the pipeline was not identified; the `parallel do` fallback with the
   /// same kind of bound is not affected.
   ///
-  /// Cloning is safe: `canEmitTeamsInTarget` already guarantees that the
-  /// target body only contains ops that are free of memory effects,
-  /// read-only, or declarations, so executing them once per thread instead of
-  /// once is not observable. Declarations are not cloned; they only rename
-  /// mapped variables and are used as is.
+  /// Cloning is safe: `canEmitTeamsInTarget` only accepts target bodies
+  /// whose ops, apart from the loop, compute values without writing anything,
+  /// such as constants, conversions and loads of mapped variables. Every
+  /// thread that runs the cloned ops computes the same values, so the results
+  /// do not change. Declarations are not cloned; they only rename mapped
+  /// variables and are used as is.
   ///
   /// Returns the original ops that were cloned, in program order. Once the
   /// `fir.do_concurrent` op is erased they normally have no users left, and
