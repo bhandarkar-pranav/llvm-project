@@ -1022,6 +1022,13 @@ private:
     // or its body) uses.
     llvm::SetVector<mlir::Operation *> toClone;
     llvm::SmallVector<mlir::Value> worklist;
+    // Seed the worklist with every value used anywhere in the
+    // `fir.do_concurrent` wrapper but defined outside it. This is deliberately
+    // the wrapper and not the inner `fir.do_concurrent.loop` op (whose
+    // live-ins `collectLoopLiveIns` computes): ops in the wrapper itself, such
+    // as the loop variables' allocations and declarations, may also use values
+    // from the target body (e.g. a dynamic size, a shape or type parameters),
+    // and those must be found too.
     mlir::visitUsedValuesDefinedAbove(
         doLoop->getRegions(),
         [&](mlir::OpOperand *operand) { worklist.push_back(operand->get()); });
