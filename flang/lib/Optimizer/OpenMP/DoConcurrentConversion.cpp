@@ -405,6 +405,65 @@ enum class EmissionContext {
   /// `omp.map.info` op and host values are remapped (via an `IRMapping`) to the
   /// corresponding target block arguments.
   NewDeviceTarget,
+
+  /// Offload requested, but the loop is already directly inside a target
+  /// region written by the user (e.g. `!$omp target` around the loop), and
+  /// apart from the loop, the region only contains code that can be executed
+  /// once per team without changing the program's behavior: computations
+  /// without side effects, memory reads, and variable declarations (see
+  /// `canEmitTeamsInTarget`). Generates the same nest as `NewDeviceTarget`
+  /// but *inside the existing target*, without creating a new one:
+  ///
+  ///   omp.target kernel_type(generic) ... { // user's op, now omp.combined
+  ///     ...declarations (and code computing their shapes), constants...
+  ///     omp.teams reduction(...) {          // omp.combined
+  ///       omp.parallel private(...) {       // omp.composite
+  ///         ...bound computations, re-evaluated here
+  ///            (see cloneTargetBodyValuesIntoParallel)...
+  ///         omp.distribute {                // omp.composite
+  ///           omp.wsloop reduction(...) {   // omp.composite
+  ///             omp.loop_nest (...) { ... }
+  ///   } } } } }
+  ///
+  /// Why not just create a nested `omp.target`? OpenMP does not allow a target
+  /// construct to be encountered inside a target region (unspecified in 4.5 /
+  /// 5.0, prohibited since 5.1 except for reverse offload), and in practice the
+  /// nested region silently does not run the loop.
+  ///
+  /// The user's target op gets the `omp.combined` marker (a target whose only
+  /// construct is a teams region must have it, as lowering does for
+  /// `!$omp target` + nested `!$omp teams`), but keeps its kernel type.
+  ///
+  /// Why keep the user's target `generic` instead of upgrading it to `spmd`?
+  /// An `spmd` kernel needs host-evaluated loop bounds, but here the bounds
+  /// are computed inside the target region. LLVM's OpenMPOpt pass converts
+  /// such generic kernels to "Generic-SPMD" at -O1 and above, and the runtime
+  /// launches many teams because of the `omp.teams` op (number of compute
+  /// units x a per-mode factor) even without a host trip count. Measured,
+  /// this is as fast as the fully combined form.
+  ///
+  /// No live-in mapping is needed: the new ops are created inside the user's
+  /// target region, where every value the loop uses is already a device value.
+  TeamsInUserTarget,
+
+  /// Offload requested and the loop is inside a target region written by the
+  /// user, but a teams nest is not possible there: the loop is not directly in
+  /// the target's body (e.g. it is inside an `if` or a sequential loop in the
+  /// target), or the target also contains other code that must not run once
+  /// per team (stores, calls, allocations, another loop). OpenMP requires a
+  /// `teams` construct nested in a `target` to be the only thing in it.
+  ///
+  /// Falls back to the same nest as `Host`, placed inside the target region:
+  ///
+  ///   omp.target ... {                        // user's op, left untouched
+  ///     ...
+  ///     omp.parallel {                        // omp.combined
+  ///       omp.wsloop private(...) reduction(...) {
+  ///         omp.loop_nest (...) { ... }
+  ///   } } }
+  ///
+  /// This is always legal and correct, but it runs on a single team.
+  ParallelInUserTarget,
 };
 
 /// Returns true if the pass creates a new `omp.target` region for the loop.
@@ -429,7 +488,8 @@ static bool remapsLiveIns(EmissionContext ctx) {
 /// `omp.composite`; otherwise `omp.parallel` + `omp.wsloop` form the combined
 /// `parallel do` construct and `omp.parallel` is marked `omp.combined`.
 static bool distributesAcrossTeams(EmissionContext ctx) {
-  return ctx == EmissionContext::NewDeviceTarget;
+  return ctx == EmissionContext::NewDeviceTarget ||
+         ctx == EmissionContext::TeamsInUserTarget;
 }
 
 /// Returns true if `private` clauses (for LOCAL / LOCAL_INIT variables) are
@@ -441,6 +501,139 @@ static bool distributesAcrossTeams(EmissionContext ctx) {
 /// In a plain `parallel do` nest the worksharing loop owns the privates.
 static bool privatizesOnParallel(EmissionContext ctx) {
   return distributesAcrossTeams(ctx);
+}
+
+/// Returns true if executing \p op once per team, instead of once, cannot be
+/// observed: \p op (including any ops nested in its regions) either has no
+/// memory effects, only reads memory, or only touches flang's
+/// `fir::DebuggingResource` (which is how `hlfir.declare` / `fir.declare`
+/// model their effect; declaring a variable allocates nothing at run time).
+///
+/// Anything that writes, allocates or frees real memory (e.g. `fir.store`,
+/// `fir.alloca`, `hlfir.assign`), and any op whose effects are unknown (e.g. a
+/// `fir.call`), is rejected.
+static bool isSafeToRunPerTeam(mlir::Operation *op) {
+  std::optional<llvm::SmallVector<mlir::MemoryEffects::EffectInstance>>
+      effects = mlir::getEffectsRecursively(op);
+  // No memory effect interface somewhere in `op`: effects are unknown.
+  if (!effects)
+    return false;
+
+  return llvm::all_of(
+      *effects, [](const mlir::MemoryEffects::EffectInstance &effect) {
+        return mlir::isa<mlir::MemoryEffects::Read>(effect.getEffect()) ||
+               mlir::isa<fir::DebuggingResource>(effect.getResource());
+      });
+}
+
+/// Decides whether a `teams distribute parallel do` nest may be emitted for
+/// \p loop inside the user-written target region \p targetOp.
+///
+/// OpenMP requires that "if a teams construct is nested within a target
+/// construct, that target construct must contain no statements, declarations
+/// or directives outside of the teams construct". Flang's semantic checks
+/// enforce this on user source, but this pass runs after semantics and
+/// creates the teams construct itself, so it must check on its own.
+///
+/// The rule is stated on source statements while this pass sees FIR ops, and
+/// some ops in the target come from the loop header rather than from separate
+/// statements. For example, for
+///
+///   !$omp target map(tofrom: a) map(to: n)
+///   do concurrent (i = 1:n)
+///     a(i) = a(i) + 1
+///   end do
+///   !$omp end target
+///
+/// the target region contains, besides the loop, the `hlfir.declare` ops of
+/// the mapped variables and a `fir.load` of `n` computing the upper bound.
+/// What actually matters is the consequence of the rule: code that is inside
+/// the target but outside the teams region is executed once per team. Reads
+/// and pure computation are harmless when repeated, writes and calls are not
+/// (`x = x + 1` would run once per team). Therefore a teams nest is emitted
+/// only if:
+///
+///   1. \p loop is directly in the body of \p targetOp (not inside an
+///      `fir.if`, a sequential loop, or another OpenMP construct within the
+///      target; a teams region there would be illegal);
+///   2. \p loop is the only `fir.do_concurrent` in \p targetOp (a target may
+///      contain at most one teams region);
+///   3. every other op in the target's body exists only to serve the loop or
+///      to declare a mapped variable: it is a declaration, or each of its
+///      users is the loop, a declaration, or another such op (unused ops must
+///      be constants). In addition, each such op must be safe to run once per
+///      team (`isSafeToRunPerTeam`).
+///
+/// Condition 3 makes the rewrite equivalent, in source terms, to turning a
+/// target region that contains only the `do concurrent` into one that
+/// contains only a `teams distribute parallel do` construct, which is legal
+/// OpenMP. After the conversion, the code left in the target body before
+/// omp.teams is only declarations, constants and shape computations, the
+/// same as lowering produces for the hand-written construct (the loop's own
+/// computations are re-evaluated in omp.parallel and the originals erased;
+/// see cloneTargetBodyValuesIntoParallel).
+static bool canEmitTeamsInTarget(fir::DoConcurrentOp loop,
+                                 mlir::omp::TargetOp targetOp) {
+  if (loop->getParentOp() != targetOp.getOperation())
+    return false;
+
+  unsigned numLoops = 0;
+  targetOp.getRegion().walk([&](fir::DoConcurrentOp) { ++numLoops; });
+  if (numLoops != 1)
+    return false;
+
+  // Condition 3: every other op only serves the loop or declares a mapped
+  // variable. The body is visited in reverse so that, when an op is examined,
+  // all of its users in the body have already been classified.
+  if (!targetOp.getRegion().hasOneBlock())
+    return false;
+  mlir::Block &body = targetOp.getRegion().front();
+  llvm::SmallPtrSet<mlir::Operation *, 16> servesLoop;
+  for (mlir::Operation &op : llvm::reverse(body)) {
+    if (&op == loop.getOperation() || mlir::isa<mlir::omp::TerminatorOp>(op))
+      continue;
+
+    // Even code that only serves the loop is executed once per team, so it
+    // must not write, allocate or call anything.
+    if (!isSafeToRunPerTeam(&op))
+      return false;
+
+    // Declarations of variables (typically the mapped variables) are allowed
+    // regardless of their users: they only give a name and, for arrays, a
+    // shape to storage that already exists. Lowering emits them in the
+    // target body for legal `!$omp target` + `!$omp teams ...` code too.
+    if (mlir::isa<hlfir::DeclareOp, fir::DeclareOp>(op)) {
+      servesLoop.insert(&op);
+      continue;
+    }
+
+    // Unused ops are only allowed if they are constants. Anything else
+    // without users (an unused read, or an unused computation that would make
+    // an otherwise unrelated read look like it serves the loop) did not come
+    // from the loop header or a declaration.
+    if (op.use_empty()) {
+      if (!op.hasTrait<mlir::OpTrait::ConstantLike>())
+        return false;
+      servesLoop.insert(&op);
+      continue;
+    }
+
+    // Every user must be the loop (a bound, or a value used in the loop
+    // body), a declaration, or another op that itself only serves the loop.
+    // For example, a `fir.load` of a mapped variable feeding the loop's upper
+    // bound passes, and so does a `fir.load` of an extent feeding the shape
+    // of an explicit-shape dummy array's declaration.
+    for (mlir::Operation *user : op.getUsers()) {
+      mlir::Operation *userInBody = body.findAncestorOpInBlock(*user);
+      if (userInBody == loop.getOperation() ||
+          (userInBody && servesLoop.contains(userInBody)))
+        continue;
+      return false;
+    }
+    servesLoop.insert(&op);
+  }
+
+  return true;
 }
 
 class DoConcurrentConversion
@@ -576,9 +769,36 @@ public:
       targetOp =
           genTargetOp(doLoop.getLoc(), rewriter, mapper, loopNestLiveIns,
                       targetClauseOps, loopNestClauseOps, liveInShapeInfoMap);
-      auto teamsOp = genTeamsOp(rewriter, loop, mapper, ctx);
       targetOp.setCombined(true);
+    }
+
+    // The teams construct is created whenever iterations are distributed
+    // across teams: either directly inside the new target region created
+    // above (NewDeviceTarget), or inside the user's existing target region
+    // (TeamsInUserTarget).
+    if (distributesAcrossTeams(ctx)) {
+      auto teamsOp = genTeamsOp(rewriter, loop, mapper, ctx);
       teamsOp.setCombined(true);
+
+      // Mark the user's target `omp.combined`, exactly as lowering does for
+      // user code written as `!$omp target` + nested `!$omp teams ...` (it
+      // marks such a target combined even when its kernel type stays
+      // `generic`). The marker is what makes the target "capture" the nested
+      // teams construct (`ComposableOpInterface::findCapturedOp`), and
+      // translation to LLVM IR uses the captured op to set up the kernel's
+      // launch configuration. Without the marker the kernel is treated as one
+      // without a teams construct: it still computes the right result, but
+      // the host requests a single team (the runtime's "no teams" value, -1),
+      // so the whole loop runs on one compute unit. With it, the runtime
+      // chooses the number of teams (e.g. 624 = 104 CUs x 6 on gfx90a for a
+      // Generic-SPMD kernel).
+      //
+      // The user's kernel type is kept (normally `generic`): the loop bounds
+      // are computed inside the region, so they cannot be host-evaluated as an
+      // `spmd` kernel would require, and OpenMPOpt promotes the generic kernel
+      // to Generic-SPMD at -O1 and above anyway.
+      if (ctx == EmissionContext::TeamsInUserTarget)
+        doLoop->getParentOfType<mlir::omp::TargetOp>().setCombined(true);
     }
 
     // Collects info about LOCAL_INIT variables that need per-iteration copy
@@ -591,6 +811,14 @@ public:
     mlir::omp::ParallelOp parallelOp =
         genParallelOp(rewriter, loop, ivInfos, mapper, localInitCopies, ctx);
 
+    // Evaluate the computations the loop depends on inside omp.parallel, as
+    // lowering does (see cloneTargetBodyValuesIntoParallel).
+    llvm::SmallVector<mlir::Operation *> clonedTargetBodyOps;
+    if (ctx == EmissionContext::TeamsInUserTarget)
+      clonedTargetBodyOps = cloneTargetBodyValuesIntoParallel(
+          rewriter, doLoop, doLoop->getParentOfType<mlir::omp::TargetOp>(),
+          mapper);
+
     // Only set as composite when part of `distribute parallel do`, and only set
     // as combined when part of `parallel do`.
     parallelOp.setComposite(distributesAcrossTeams(ctx));
@@ -599,8 +827,17 @@ public:
     // When a new target region is created, the loop nest clause operands were
     // already generated above (their bounds must be host-evaluated and remapped
     // into the target region). Otherwise generate them here, in place.
-    if (!createsTargetRegion(ctx))
+    if (!createsTargetRegion(ctx)) {
       genLoopNestClauseOps(doLoop.getLoc(), rewriter, loop, loopNestClauseOps);
+      // Bounds computed in the user's target body may have been cloned into
+      // the parallel region (see cloneTargetBodyValuesIntoParallel); use the
+      // clones.
+      for (auto *bounds :
+           {&loopNestClauseOps.loopLowerBounds,
+            &loopNestClauseOps.loopUpperBounds, &loopNestClauseOps.loopSteps})
+        for (mlir::Value &bound : *bounds)
+          bound = mapper.lookupOrDefault(bound);
+    }
 
     for (mlir::Value local : locals)
       looputils::localizeLoopLocalValue(local, parallelOp.getRegion(),
@@ -693,14 +930,25 @@ public:
 
     // Collect iteration variable(s) allocations so that we can move them
     // outside the `fir.do_concurrent` wrapper (before erasing it).
-    llvm::SmallVector<mlir::Operation *> opsToMove;
-    for (mlir::Operation &op : llvm::drop_end(doLoop))
-      opsToMove.push_back(&op);
+    //
+    // Not for TeamsInUserTarget: there the nearest allocation block is the
+    // user's target body, i.e. the code before omp.teams, which must only
+    // contain declarations, constants and shape computations (see
+    // canEmitTeamsInTarget). The loop body uses the copies of these ops
+    // created inside omp.parallel (genLoopNestIndVarAllocs), so the originals
+    // are simply erased together with the wrapper below. Values defined in
+    // the wrapper cannot be used outside of it, so nothing else refers to
+    // them.
+    if (ctx != EmissionContext::TeamsInUserTarget) {
+      llvm::SmallVector<mlir::Operation *> opsToMove;
+      for (mlir::Operation &op : llvm::drop_end(doLoop))
+        opsToMove.push_back(&op);
 
-    mlir::Block *allocBlock = builder.getAllocaBlock();
+      mlir::Block *allocBlock = builder.getAllocaBlock();
 
-    for (mlir::Operation *op : llvm::reverse(opsToMove)) {
-      rewriter.moveOpBefore(op, allocBlock, allocBlock->begin());
+      for (mlir::Operation *op : llvm::reverse(opsToMove)) {
+        rewriter.moveOpBefore(op, allocBlock, allocBlock->begin());
+      }
     }
 
     // Mark `unordered` loops that are not perfectly nested to be skipped from
@@ -712,10 +960,87 @@ public:
 
     rewriter.eraseOp(doLoop);
 
+    // The originals of the target-body computations that were re-evaluated in
+    // omp.parallel were only used by the (now erased) loop. Erase them, users
+    // before definitions, so that the code before omp.teams is the same as
+    // lowering produces for `!$omp target` + `!$omp teams distribute parallel
+    // do`. An original that still has users is kept.
+    for (mlir::Operation *op : llvm::reverse(clonedTargetBodyOps))
+      if (op->use_empty())
+        rewriter.eraseOp(op);
+
     return mlir::success();
   }
 
 private:
+  /// For a loop converted inside the user's target region (TeamsInUserTarget),
+  /// clone into the just-created omp.parallel region every computation from
+  /// the target's body whose result the loop uses (typically the loop bounds,
+  /// e.g. a `fir.load` of a mapped variable), and map the originals to the
+  /// clones in \p mapper. The insertion point must be inside the parallel
+  /// region, before the omp.distribute op is created.
+  ///
+  /// Why: this reproduces where lowering places such computations. For user
+  /// code written as `!$omp target` / `!$omp teams` / `!$omp distribute
+  /// parallel do`, lowering evaluates the loop bounds inside omp.parallel,
+  /// right before omp.distribute (it cannot place statements between `target`
+  /// and `teams`, which OpenMP forbids). Leaving the computations in the
+  /// target body and using their results as bounds of the composite
+  /// `distribute parallel do` nest was observed to miscompile: with
+  /// unoptimized front-end output that OpenMPOpt promotes to Generic-SPMD
+  /// during device LTO (flang's default when no -O flag is given), a bound
+  /// loaded in the target body reached the loop with a wrong value (writing 40
+  /// of 10000 elements, or a GPU memory access fault). The root cause further
+  /// down the pipeline was not identified; the `parallel do` fallback with the
+  /// same kind of bound is not affected.
+  ///
+  /// Cloning is safe: `canEmitTeamsInTarget` already guarantees that the
+  /// target body only contains ops that are free of memory effects,
+  /// read-only, or declarations, so executing them once per thread instead of
+  /// once is not observable. Declarations are not cloned; they only rename
+  /// mapped variables and are used as is.
+  ///
+  /// Returns the original ops that were cloned, in program order. Once the
+  /// `fir.do_concurrent` op is erased they normally have no users left, and
+  /// the caller erases them, so that only declarations, constants and shape
+  /// computations remain in the target body before omp.teams.
+  llvm::SmallVector<mlir::Operation *> cloneTargetBodyValuesIntoParallel(
+      mlir::ConversionPatternRewriter &rewriter, fir::DoConcurrentOp doLoop,
+      mlir::omp::TargetOp targetOp, mlir::IRMapping &mapper) const {
+    // An op is cloned if it is directly in the target's body (not nested in
+    // another op of the body), is not the loop itself, and is not a
+    // declaration.
+    auto isClonableBodyOp = [&](mlir::Operation *op) {
+      return op && op->getParentOp() == targetOp.getOperation() &&
+             op != doLoop.getOperation() &&
+             !mlir::isa<hlfir::DeclareOp, fir::DeclareOp>(op);
+    };
+
+    // Collect, transitively, the body ops whose results the loop (its bounds
+    // or its body) uses.
+    llvm::SetVector<mlir::Operation *> toClone;
+    llvm::SmallVector<mlir::Value> worklist;
+    mlir::visitUsedValuesDefinedAbove(
+        doLoop->getRegions(),
+        [&](mlir::OpOperand *operand) { worklist.push_back(operand->get()); });
+    while (!worklist.empty()) {
+      mlir::Operation *def = worklist.pop_back_val().getDefiningOp();
+      if (!isClonableBodyOp(def) || !toClone.insert(def))
+        continue;
+      for (mlir::Value operand : def->getOperands())
+        worklist.push_back(operand);
+    }
+    // Clone in original program order so that operands precede their users.
+    llvm::SmallVector<mlir::Operation *> ordered(toClone.begin(),
+                                                 toClone.end());
+    llvm::sort(ordered, [](mlir::Operation *a, mlir::Operation *b) {
+      return a->isBeforeInBlock(b);
+    });
+    for (mlir::Operation *op : ordered)
+      rewriter.clone(*op, mapper);
+    return ordered;
+  }
+
   mlir::omp::ParallelOp genParallelOp(
       mlir::ConversionPatternRewriter &rewriter, fir::DoConcurrentLoopOp loop,
       looputils::InductionVariableInfos &ivInfos, mlir::IRMapping &mapper,
@@ -1301,8 +1626,20 @@ private:
           moduleSymbolTable.insert(ompReducer);
         }
 
-        reductionClauseOps.reductionVars.push_back(
-            remapsLiveIns(ctx) ? mapper.lookup(var) : var);
+        // Which SSA value is reduced into depends on what was created before
+        // this clause:
+        //   - Host / ParallelInUserTarget: nothing remaps `var`, use it as is.
+        //   - NewDeviceTarget, teams clause: `var` was mapped to the new
+        //     target's block argument by genTargetOp.
+        //   - NewDeviceTarget / TeamsInUserTarget, wsloop clause: genTeamsOp
+        //     mapped `var` to the omp.teams reduction block argument, so the
+        //     worksharing loop reduces into the per-team private copy, which
+        //     the teams reduction then combines.
+        // `lookupOrDefault` covers all cases; when the loop was moved into a
+        // new target region a mapping must exist.
+        assert((!remapsLiveIns(ctx) || mapper.contains(var)) &&
+               "reduction variable not mapped into the new target region");
+        reductionClauseOps.reductionVars.push_back(mapper.lookupOrDefault(var));
         reductionClauseOps.reductionByref.push_back(byRef);
         reductionClauseOps.reductionSyms.push_back(
             mlir::SymbolRefAttr::get(ompReducer));
@@ -1314,14 +1651,28 @@ private:
   /// `EmissionContext`).
   ///
   /// This is the single place that interprets the user's
-  /// `-fdo-concurrent-to-openmp` request. For now the decision depends only on
-  /// that request; \p doLoop is taken so that the decision can later also
-  /// depend on where the loop is (for example, a loop that is already inside
-  /// an `omp.target` region must not get a nested target region).
-  EmissionContext
-  computeEmissionContext([[maybe_unused]] fir::DoConcurrentOp doLoop) const {
-    return mapToDevice ? EmissionContext::NewDeviceTarget
-                       : EmissionContext::Host;
+  /// `-fdo-concurrent-to-openmp` request. The decision also depends on where
+  /// \p doLoop is:
+  ///
+  ///   =host                                     -> Host
+  ///   =device, not inside any omp.target        -> NewDeviceTarget
+  ///   =device, inside a user omp.target, and a teams nest may be emitted
+  ///            there (canEmitTeamsInTarget)     -> TeamsInUserTarget
+  ///   =device, inside a user omp.target otherwise -> ParallelInUserTarget
+  ///
+  /// With =host, a loop inside a user target keeps getting the Host nest,
+  /// which is also legal there (same as before this distinction existed).
+  EmissionContext computeEmissionContext(fir::DoConcurrentOp doLoop) const {
+    if (!mapToDevice)
+      return EmissionContext::Host;
+
+    auto enclosingTarget = doLoop->getParentOfType<mlir::omp::TargetOp>();
+    if (!enclosingTarget)
+      return EmissionContext::NewDeviceTarget;
+
+    return canEmitTeamsInTarget(doLoop, enclosingTarget)
+               ? EmissionContext::TeamsInUserTarget
+               : EmissionContext::ParallelInUserTarget;
   }
 
   /// The user's request: `-fdo-concurrent-to-openmp=device` (true) or `=host`
