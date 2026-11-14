@@ -1009,6 +1009,14 @@ private:
   llvm::SmallVector<mlir::Operation *> cloneTargetBodyValuesIntoParallel(
       mlir::ConversionPatternRewriter &rewriter, fir::DoConcurrentOp doLoop,
       mlir::omp::TargetOp targetOp, mlir::IRMapping &mapper) const {
+    // The clones must end up inside omp.parallel, before omp.distribute is
+    // created. The caller relies on genParallelOp leaving the insertion point
+    // before the parallel region's terminator; check it so that a future
+    // reordering of matchAndRewrite does not silently place them elsewhere.
+    assert(mlir::isa<mlir::omp::ParallelOp>(
+               rewriter.getInsertionBlock()->getParentOp()) &&
+           "expected the insertion point to be inside the omp.parallel region");
+
     // An op is cloned if it is directly in the target's body (not nested in
     // another op of the body), is not the loop itself, and is not a
     // declaration.
