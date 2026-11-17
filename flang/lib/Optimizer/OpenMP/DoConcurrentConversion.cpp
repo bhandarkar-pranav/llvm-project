@@ -1473,6 +1473,16 @@ private:
     mlir::omp::TeamsOperands teamsOps;
     genReductions(rewriter, mapper, loop, teamsOps, ctx);
 
+    // omp.teams must be nested directly in an omp.target region: the new one
+    // created by genTargetOp (NewDeviceTarget), or the user's target containing
+    // the loop (TeamsInUserTarget, where the insertion point is still the
+    // driver's default, right before the loop). Checked after genReductions,
+    // which temporarily moves the insertion point to create the reduction
+    // declarations and must restore it.
+    assert(mlir::isa<mlir::omp::TargetOp>(
+               rewriter.getInsertionBlock()->getParentOp()) &&
+           "expected the insertion point to be directly inside an omp.target");
+
     mlir::Location loc = loop.getLoc();
     auto teamsOp = mlir::omp::TeamsOp::create(rewriter, loc, teamsOps);
     Fortran::common::openmp::EntryBlockArgs teamsArgs;
