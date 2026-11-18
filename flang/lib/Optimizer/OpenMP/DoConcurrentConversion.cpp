@@ -741,14 +741,38 @@ static bool canEmitTeamsInTarget(fir::DoConcurrentOp loop,
     if (!mlir::isMemoryEffectFree(dep))
       return false;
 
-  // Condition 5: ops in the `fir.do_concurrent` wrapper (besides the loop op)
-  // other than the loop variables' storage. In the teams nest the wrapper is
-  // erased rather than moved into the target body, so any such op that the
-  // loop uses is moved into omp.parallel instead (see matchAndRewrite). That
-  // is only valid for ops without memory effects (re-executed per thread,
-  // see condition 4) and declarations, and only if they do not use the loop
-  // variables' storage, which is erased with the wrapper. Lowering does not
-  // emit any such op today; this keeps the conversion correct if it does.
+  // Condition 5: the `fir.do_concurrent` wrapper must not contain ops that
+  // cannot be moved into omp.parallel.
+  //
+  // Besides the inner `fir.do_concurrent.loop` op, the wrapper normally holds
+  // only the loop variables' storage (an `fir.alloca` and its declaration per
+  // variable). The op allows anything else there, though, and the loop body
+  // may use it, e.g. a constant:
+  //
+  //   fir.do_concurrent {
+  //     %i = fir.alloca i32 <{bindc_name = "i"}>          // loop variable
+  //     %i_decl:2 = hlfir.declare %i uniq_name("_QFEi")   //   storage
+  //     %w = arith.constant 7.000000e+00 : f32            // any other op
+  //     fir.do_concurrent.loop (%iv) = (%lb) to (%ub) step (%st) {
+  //       ...
+  //       hlfir.assign %w to %elt : f32, !fir.ref<f32>    // used in the body
+  //     }
+  //   }
+  //
+  // In the teams nest the wrapper is erased, not moved into the target body,
+  // and the loop variables' storage is replaced by copies inside
+  // omp.parallel. The loop body copied into omp.loop_nest still uses `%w`, so
+  // every other op in the wrapper is moved into omp.parallel instead (see
+  // matchAndRewrite). There it runs once per thread, which is only safe if it
+  // has no memory effects (see condition 4) or is a declaration. It also
+  // must not use the loop variables' storage, which is erased with the
+  // wrapper. A wrapper holding, for example,
+  //
+  //     %w = fir.load %m_decl#0 : !fir.ref<f32>
+  //
+  // therefore makes the pass use the `parallel do` fallback, which runs the
+  // load once, before omp.parallel. Lowering does not emit such ops today;
+  // this keeps the conversion correct if it does.
   llvm::SmallPtrSet<mlir::Operation *, 4> ivStorage =
       getLoopVariableStorageOps(loop);
   for (mlir::Operation &op : llvm::drop_end(loop.getRegion().front())) {
