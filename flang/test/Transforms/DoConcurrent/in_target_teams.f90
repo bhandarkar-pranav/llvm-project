@@ -1,8 +1,9 @@
 ! Tests the conversion of a `do concurrent` loop that is already inside a
 ! user-written `!$omp target` region, when apart from the loop the region
-! only contains code that can be executed once per team without changing the
-! program's behavior (computations without side effects, memory reads and
-! variable declarations).
+! only contains variable declarations (and the code computing their shapes)
+! and constants, and the loop's bounds do not read memory. (A bound that reads
+! memory, e.g. a mapped `n`, gets the `parallel do` fallback for now; see
+! in_target_fallback.f90.)
 !
 ! With -fdo-concurrent-to-openmp=device, the pass must not create a new
 ! (nested) omp.target. Instead it emits the `teams distribute parallel do`
@@ -25,42 +26,36 @@
 ! RUN:   -fopenmp-is-target-device -fdo-concurrent-to-openmp=device %s -o - \
 ! RUN: | FileCheck %s
 
-! The upper bound is read from a mapped variable, i.e. there is a fir.load
-! inside the target region. Reads are safe to repeat per team, so this must
-! still produce the teams nest. The computations the loop depends on are
-! re-evaluated inside omp.parallel, before omp.distribute, which is where
-! lowering places loop bounds for `!$omp target` + `!$omp teams` +
-! `!$omp distribute parallel do`.
-subroutine bound_from_mapped_var(a, n)
+! Constant bounds: the bound computations (converts of constants) are
+! re-evaluated inside omp.parallel, before omp.distribute, and the originals
+! are erased, so only constants, shapes and declarations precede omp.teams.
+subroutine constant_bounds(a)
   implicit none
-  integer :: n, i
-  real :: a(n)
-  !$omp target map(tofrom: a) map(to: n)
-  do concurrent (i = 1:n)
+  integer :: i
+  real :: a(1000)
+  !$omp target map(tofrom: a)
+  do concurrent (i = 1:1000)
     a(i) = a(i) + 1
   end do
   !$omp end target
 end subroutine
 
-! CHECK-LABEL: func.func @_QPbound_from_mapped_var
+! CHECK-LABEL: func.func @_QPconstant_bounds
 ! CHECK:         omp.target kernel_type(generic)
 ! CHECK-NOT:     host_eval
 ! CHECK-SAME:    {
-! CHECK:           %[[N_DECL:.*]]:2 = hlfir.declare %{{.*}} {{.*}}uniq_name("_QFbound_from_mapped_varEn")
-! Only constants, shapes and declarations remain before omp.teams: the
-! original bound computations (and the original loop index allocation) are
-! not left in the target body.
+! CHECK:           hlfir.declare %{{.*}} {{.*}}uniq_name("_QFconstant_boundsEa")
 ! CHECK-NOT:       fir.load
 ! CHECK-NOT:       fir.alloca
 ! CHECK-NOT:       fir.convert
 ! CHECK-NOT:       omp.target
 ! CHECK:           omp.teams {
 ! CHECK-NEXT:        omp.parallel {
-! CHECK:               %[[N:.*]] = fir.load %[[N_DECL]]#0 : !fir.ref<i32>
-! CHECK-NEXT:          %[[UB:.*]] = fir.convert %[[N]] : (i32) -> index
+! CHECK:               %[[LB:.*]] = fir.convert %{{.*}} : (i32) -> index
+! CHECK:               %[[UB:.*]] = fir.convert %{{.*}} : (i32) -> index
 ! CHECK:               omp.distribute {
 ! CHECK-NEXT:            omp.wsloop {
-! CHECK-NEXT:              omp.loop_nest (%{{.*}}) : index = (%{{.*}}) to (%[[UB]]) inclusive step (%{{.*}}) {
+! CHECK-NEXT:              omp.loop_nest (%{{.*}}) : index = (%[[LB]]) to (%[[UB]]) inclusive step (%{{.*}}) {
 ! CHECK-NOT:       fir.do_concurrent
 ! CHECK:                 } {omp.composite}
 ! CHECK-NEXT:          } {omp.composite}
@@ -98,18 +93,17 @@ end subroutine
 ! CHECK:           omp.terminator
 ! CHECK-NEXT:    } {omp.combined}
 
-! Explicit-shape dummy array: the extent `n` is loaded in the target body to
-! build the shape of `a`'s declaration. Code that only feeds a declaration is
-! allowed before omp.teams (lowering emits the same code for the hand-written
-! `!$omp target` + `!$omp teams distribute parallel do`), so this still gets
-! the teams nest. The loop's own upper bound is a separate load, re-evaluated
-! inside omp.parallel.
+! Explicit-shape dummy array with constant loop bounds: the extent `n` is
+! loaded in the target body only to build the shape of `a`'s declaration.
+! Code that only feeds a declaration is allowed before omp.teams (lowering
+! emits the same code for the hand-written `!$omp target` +
+! `!$omp teams distribute parallel do`), so this gets the teams nest.
 subroutine explicit_shape_dummy(a, n)
   implicit none
   integer :: n, i
   real :: a(n)
   !$omp target map(tofrom: a) map(to: n)
-  do concurrent (i = 1:n)
+  do concurrent (i = 1:100)
     a(i) = a(i) + real(i)
   end do
   !$omp end target
@@ -120,16 +114,14 @@ end subroutine
 ! CHECK:           %[[EXT:.*]] = fir.load %{{.*}} : !fir.ref<i32>
 ! CHECK:           %[[SHAPE:.*]] = fir.shape %{{.*}} : (index) -> !fir.shape<1>
 ! CHECK:           hlfir.declare %{{.*}}(%[[SHAPE]]) {{.*}}uniq_name("_QFexplicit_shape_dummyEa")
-! CHECK:           %[[N_DECL:.*]]:2 = hlfir.declare %{{.*}} {{.*}}uniq_name("_QFexplicit_shape_dummyEn")
+! CHECK:           hlfir.declare %{{.*}} {{.*}}uniq_name("_QFexplicit_shape_dummyEn")
 ! CHECK-NOT:       fir.load
 ! CHECK-NOT:       omp.target
 ! CHECK:           omp.teams {
 ! CHECK-NEXT:        omp.parallel {
-! CHECK:               %[[N:.*]] = fir.load %[[N_DECL]]#0 : !fir.ref<i32>
-! CHECK-NEXT:          %[[UB:.*]] = fir.convert %[[N]] : (i32) -> index
 ! CHECK:               omp.distribute {
 ! CHECK-NEXT:            omp.wsloop {
-! CHECK-NEXT:              omp.loop_nest (%{{.*}}) : index = (%{{.*}}) to (%[[UB]]) inclusive step (%{{.*}}) {
+! CHECK-NEXT:              omp.loop_nest
 ! CHECK:           } {omp.combined}
 ! CHECK:           omp.terminator
 ! CHECK-NEXT:    } {omp.combined}

@@ -71,6 +71,19 @@ program do_concurrent_in_target
   !$omp end target
   print *, "teams, 2-D:", sum(c)
 
+  ! A bound read from a mapped variable that one iteration writes (conforming:
+  ! a single iteration writes nn). Fortran evaluates the bounds once, before
+  ! the loop, so all n elements must be written exactly once. The conversion
+  ! must not re-read the bound per thread; it uses the parallel do fallback.
+  a = 0; nn = n
+  !$omp target map(tofrom: a, nn)
+  do concurrent (i = 1:nn)
+    if (i == 1) nn = 10
+    a(i) = a(i) + 1
+  end do
+  !$omp end target
+  print *, "fallback, bound written in the loop:", count(a == 1)
+
   ! Fallback: a statement precedes the loop in the target.
   a = 0; x = 0
   !$omp target map(tofrom: a, x)
@@ -131,6 +144,7 @@ end program
 ! CHECK: teams, local: 59996.
 ! CHECK: teams, local_init: 60000.
 ! CHECK: teams, 2-D: 10000.
+! CHECK: fallback, bound written in the loop: 10000
 ! CHECK: fallback, statement before loop: 20000.
 ! CHECK: fallback, two loops: 20000.
 ! CHECK: fallback, loop inside if: 30000.

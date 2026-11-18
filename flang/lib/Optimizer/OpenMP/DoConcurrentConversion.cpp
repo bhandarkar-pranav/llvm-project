@@ -408,9 +408,9 @@ enum class EmissionContext {
 
   /// Offload requested, but the loop is already directly inside a target
   /// region written by the user (e.g. `!$omp target` around the loop), and
-  /// apart from the loop, the region only contains code that can be executed
-  /// once per team without changing the program's behavior: computations
-  /// without side effects, memory reads, and variable declarations (see
+  /// apart from the loop, the region only contains variable declarations (and
+  /// the code computing their shapes) and constants, and the computations the
+  /// loop depends on (typically its bounds) do not read memory (see
   /// `canEmitTeamsInTarget`). Generates the same nest as `NewDeviceTarget`
   /// but *inside the existing target*, without creating a new one:
   ///
@@ -527,6 +527,85 @@ static bool isSafeToRunPerTeam(mlir::Operation *op) {
       });
 }
 
+/// Returns, in program order, the ops in \p targetOp's body that \p loop
+/// depends on: every op directly in the target's body (not nested in another
+/// op of the body) whose result is used, directly or transitively, anywhere
+/// in the `fir.do_concurrent` wrapper \p loop. Declarations and the loop
+/// itself are excluded; the walk stops at declarations, which only rename
+/// mapped variables.
+///
+/// For a loop alone in a user target these are typically the loop's bound
+/// computations, e.g. for `do concurrent (i = 1:nn)`:
+///
+///   %lb = fir.convert %c1_i32 : (i32) -> index
+///   %n  = fir.load %nn_decl#0 : !fir.ref<i32>
+///   %ub = fir.convert %n : (i32) -> index
+///
+/// (Because `%n` reads memory, canEmitTeamsInTarget rejects this loop and the
+/// pass uses the `parallel do` fallback; see its condition 4.)
+///
+/// Used both to decide whether the teams nest may be emitted
+/// (canEmitTeamsInTarget) and to re-evaluate these computations inside
+/// omp.parallel (cloneTargetBodyValuesIntoParallel), so the two always agree
+/// on the set.
+static llvm::SmallVector<mlir::Operation *>
+collectTargetBodyDependencies(fir::DoConcurrentOp loop,
+                              mlir::omp::TargetOp targetOp) {
+  auto isBodyDependency = [&](mlir::Operation *op) {
+    return op && op->getParentOp() == targetOp.getOperation() &&
+           op != loop.getOperation() &&
+           !mlir::isa<hlfir::DeclareOp, fir::DeclareOp>(op);
+  };
+
+  llvm::SetVector<mlir::Operation *> deps;
+  llvm::SmallVector<mlir::Value> worklist;
+  // Seed the worklist with every value used anywhere in the
+  // `fir.do_concurrent` wrapper but defined outside it. This is deliberately
+  // the wrapper and not the inner `fir.do_concurrent.loop` op (whose
+  // live-ins `collectLoopLiveIns` computes): ops in the wrapper itself, such
+  // as the loop variables' allocations and declarations, may also use values
+  // from the target body (e.g. a dynamic size, a shape or type parameters),
+  // and those must be found too.
+  mlir::visitUsedValuesDefinedAbove(
+      loop->getRegions(),
+      [&](mlir::OpOperand *operand) { worklist.push_back(operand->get()); });
+  while (!worklist.empty()) {
+    mlir::Operation *def = worklist.pop_back_val().getDefiningOp();
+    if (!isBodyDependency(def) || !deps.insert(def))
+      continue;
+    for (mlir::Value operand : def->getOperands())
+      worklist.push_back(operand);
+  }
+
+  // Program order, so that operands precede their users when cloned.
+  llvm::SmallVector<mlir::Operation *> ordered(deps.begin(), deps.end());
+  llvm::sort(ordered, [](mlir::Operation *a, mlir::Operation *b) {
+    return a->isBeforeInBlock(b);
+  });
+  return ordered;
+}
+
+/// Returns the ops in the `fir.do_concurrent` wrapper \p loop that hold the
+/// loop variables: for each induction variable, the op defining the memory it
+/// is stored to (normally its `hlfir.declare`) and the ops defining that op's
+/// operands (normally its `fir.alloca`). These are the ops that
+/// genLoopNestIndVarAllocs copies into omp.parallel; the converted loop body
+/// uses the copies.
+static llvm::SmallPtrSet<mlir::Operation *, 4>
+getLoopVariableStorageOps(fir::DoConcurrentOp loop) {
+  llvm::SmallPtrSet<mlir::Operation *, 4> ops;
+  auto loopOp = mlir::cast<fir::DoConcurrentLoopOp>(
+      loop.getRegion().back().getTerminator());
+  for (mlir::Value iv : *loopOp.getLoopInductionVars()) {
+    looputils::InductionVariableInfo info(loopOp, iv);
+    ops.insert(info.iterVarMemDef);
+    for (mlir::Value operand : info.iterVarMemDef->getOperands())
+      if (mlir::Operation *def = operand.getDefiningOp())
+        ops.insert(def);
+  }
+  return ops;
+}
+
 /// Decides whether a `teams distribute parallel do` nest may be emitted for
 /// \p loop inside the user-written target region \p targetOp.
 ///
@@ -563,7 +642,14 @@ static bool isSafeToRunPerTeam(mlir::Operation *op) {
 ///      to declare a mapped variable: it is a declaration, or each of its
 ///      users is the loop, a declaration, or another such op (unused ops must
 ///      be constants). In addition, each such op must be safe to run once per
-///      team (`isSafeToRunPerTeam`).
+///      team (`isSafeToRunPerTeam`);
+///   4. the computations the loop depends on (typically its bounds) have no
+///      memory effects, so they can be re-evaluated per thread inside
+///      omp.parallel; a bound that reads memory (e.g. a mapped `nn`) falls
+///      back to `parallel do` until bounds are host-evaluated;
+///   5. ops in the `fir.do_concurrent` wrapper other than the loop variables'
+///      storage have no memory effects (or are declarations) and do not use
+///      that storage, so they can be moved into omp.parallel.
 ///
 /// Condition 3 makes the rewrite equivalent, in source terms, to turning a
 /// target region that contains only the `do concurrent` into one that
@@ -621,9 +707,10 @@ static bool canEmitTeamsInTarget(fir::DoConcurrentOp loop,
 
     // Every user must be the loop (a bound, or a value used in the loop
     // body), a declaration, or another op that itself only serves the loop.
-    // For example, a `fir.load` of a mapped variable feeding the loop's upper
-    // bound passes, and so does a `fir.load` of an extent feeding the shape
-    // of an explicit-shape dummy array's declaration.
+    // For example, a `fir.load` of an extent feeding the shape of an
+    // explicit-shape dummy array's declaration passes. (A `fir.load` feeding
+    // the loop's own bound also passes this condition but is rejected by
+    // condition 4 below.)
     for (mlir::Operation *user : op.getUsers()) {
       mlir::Operation *userInBody = body.findAncestorOpInBlock(*user);
       if (userInBody == loop.getOperation() ||
@@ -632,6 +719,47 @@ static bool canEmitTeamsInTarget(fir::DoConcurrentOp loop,
       return false;
     }
     servesLoop.insert(&op);
+  }
+
+  // Condition 4: the computations the loop depends on must not read (or
+  // otherwise touch) memory. In the teams nest they are re-evaluated by
+  // every thread inside omp.parallel (cloneTargetBodyValuesIntoParallel),
+  // and threads start at different times. If such a computation read memory,
+  // a thread that starts late could observe a write made by an iteration
+  // another thread already executed, e.g.
+  //
+  //   do concurrent (i = 1:nn)      ! upper bound reads nn
+  //     if (i == 1) nn = 10         ! conforming: a single iteration writes nn
+  //
+  // where late threads would compute a different iteration space. Fortran
+  // evaluates the bounds once, before the loop; the `parallel do` fallback
+  // does exactly that (it reads them once, before omp.parallel). The proper
+  // fix is to evaluate such bounds on the host and pass them as `host_eval`
+  // operands of the target, as lowering does for `!$omp target` +
+  // `!$omp teams distribute parallel do`; until then, fall back.
+  for (mlir::Operation *dep : collectTargetBodyDependencies(loop, targetOp))
+    if (!mlir::isMemoryEffectFree(dep))
+      return false;
+
+  // Condition 5: ops in the `fir.do_concurrent` wrapper (besides the loop op)
+  // other than the loop variables' storage. In the teams nest the wrapper is
+  // erased rather than moved into the target body, so any such op that the
+  // loop uses is moved into omp.parallel instead (see matchAndRewrite). That
+  // is only valid for ops without memory effects (re-executed per thread,
+  // see condition 4) and declarations, and only if they do not use the loop
+  // variables' storage, which is erased with the wrapper. Lowering does not
+  // emit any such op today; this keeps the conversion correct if it does.
+  llvm::SmallPtrSet<mlir::Operation *, 4> ivStorage =
+      getLoopVariableStorageOps(loop);
+  for (mlir::Operation &op : llvm::drop_end(loop.getRegion().front())) {
+    if (ivStorage.contains(&op))
+      continue;
+    if (!mlir::isMemoryEffectFree(&op) &&
+        !mlir::isa<hlfir::DeclareOp, fir::DeclareOp>(op))
+      return false;
+    for (mlir::Value operand : op.getOperands())
+      if (ivStorage.contains(operand.getDefiningOp()))
+        return false;
   }
 
   return true;
@@ -935,12 +1063,50 @@ public:
     // Not for TeamsInUserTarget: there the nearest allocation block is the
     // user's target body, i.e. the code before omp.teams, which must only
     // contain declarations, constants and shape computations (see
-    // canEmitTeamsInTarget). The loop body uses the copies of these ops
-    // created inside omp.parallel (genLoopNestIndVarAllocs), so the originals
-    // are simply erased together with the wrapper below. Values defined in
-    // the wrapper cannot be used outside of it, so nothing else refers to
-    // them.
-    if (ctx != EmissionContext::TeamsInUserTarget) {
+    // canEmitTeamsInTarget). Instead:
+    //   - the loop variables' storage is left in the wrapper and erased with
+    //     it: the converted loop body uses the copies created inside
+    //     omp.parallel by genLoopNestIndVarAllocs (mapped via `mapper`);
+    //   - any other op in the wrapper is moved to the start of the
+    //     omp.parallel region. The loop body was cloned out of the wrapper
+    //     into omp.loop_nest with only the loop variables mapped, so the clone
+    //     may still use such an op; erasing it would leave dangling uses.
+    //     canEmitTeamsInTarget (condition 5) guarantees these ops have no
+    //     memory effects (or are declarations) and do not use the loop
+    //     variables' storage, so running them per thread is safe and their
+    //     operands are available there. Lowering does not emit such ops today.
+    if (ctx == EmissionContext::TeamsInUserTarget) {
+      llvm::SmallPtrSet<mlir::Operation *, 4> ivStorage =
+          getLoopVariableStorageOps(doLoop);
+      mlir::Block &parallelEntry = parallelOp.getRegion().front();
+      // Moving each op, in program order, before the same anchor keeps their
+      // relative order.
+      mlir::Operation *anchor = &parallelEntry.front();
+      for (mlir::Operation &op : llvm::make_early_inc_range(
+               llvm::drop_end(doLoop.getRegion().front())))
+        if (!ivStorage.contains(&op))
+          rewriter.moveOpBefore(&op, anchor);
+    } else {
+      // Host and ParallelInUserTarget: ops other than the loop variables'
+      // storage are moved to just before the generated omp.parallel (the
+      // outermost new op in these contexts), not to the allocation block: an
+      // arbitrary op may use values defined after the start of the allocation
+      // block (e.g. a load of a variable declared later in the target body),
+      // and before omp.parallel it still runs once, before the loop, as in the
+      // original wrapper, and dominates its uses inside the parallel region.
+      // Lowering only puts the loop variables' storage in the wrapper, so this
+      // does not change the generated code today. NewDeviceTarget keeps the
+      // old behavior: there the loop body moves into a new IsolatedFromAbove
+      // omp.target, which other wrapper ops could not be used from anyway.
+      if (ctx != EmissionContext::NewDeviceTarget) {
+        llvm::SmallPtrSet<mlir::Operation *, 4> ivStorage =
+            getLoopVariableStorageOps(doLoop);
+        for (mlir::Operation &op : llvm::make_early_inc_range(
+                 llvm::drop_end(doLoop.getRegion().front())))
+          if (!ivStorage.contains(&op))
+            rewriter.moveOpBefore(&op, parallelOp);
+      }
+
       llvm::SmallVector<mlir::Operation *> opsToMove;
       for (mlir::Operation &op : llvm::drop_end(doLoop))
         opsToMove.push_back(&op);
@@ -977,7 +1143,8 @@ private:
   /// For a loop converted inside the user's target region (TeamsInUserTarget),
   /// clone into the just-created omp.parallel region every computation from
   /// the target's body whose result the loop uses (typically the loop bounds,
-  /// e.g. a `fir.load` of a mapped variable), and map the originals to the
+  /// e.g. conversions of constants; computations that read memory are
+  /// rejected by canEmitTeamsInTarget), and map the originals to the
   /// clones in \p mapper. The insertion point must be inside the parallel
   /// region, before the omp.distribute op is created.
   ///
@@ -1017,42 +1184,10 @@ private:
                rewriter.getInsertionBlock()->getParentOp()) &&
            "expected the insertion point to be inside the omp.parallel region");
 
-    // An op is cloned if it is directly in the target's body (not nested in
-    // another op of the body), is not the loop itself, and is not a
-    // declaration.
-    auto isClonableBodyOp = [&](mlir::Operation *op) {
-      return op && op->getParentOp() == targetOp.getOperation() &&
-             op != doLoop.getOperation() &&
-             !mlir::isa<hlfir::DeclareOp, fir::DeclareOp>(op);
-    };
-
-    // Collect, transitively, the body ops whose results the loop (its bounds
-    // or its body) uses.
-    llvm::SetVector<mlir::Operation *> toClone;
-    llvm::SmallVector<mlir::Value> worklist;
-    // Seed the worklist with every value used anywhere in the
-    // `fir.do_concurrent` wrapper but defined outside it. This is deliberately
-    // the wrapper and not the inner `fir.do_concurrent.loop` op (whose
-    // live-ins `collectLoopLiveIns` computes): ops in the wrapper itself, such
-    // as the loop variables' allocations and declarations, may also use values
-    // from the target body (e.g. a dynamic size, a shape or type parameters),
-    // and those must be found too.
-    mlir::visitUsedValuesDefinedAbove(
-        doLoop->getRegions(),
-        [&](mlir::OpOperand *operand) { worklist.push_back(operand->get()); });
-    while (!worklist.empty()) {
-      mlir::Operation *def = worklist.pop_back_val().getDefiningOp();
-      if (!isClonableBodyOp(def) || !toClone.insert(def))
-        continue;
-      for (mlir::Value operand : def->getOperands())
-        worklist.push_back(operand);
-    }
-    // Clone in original program order so that operands precede their users.
-    llvm::SmallVector<mlir::Operation *> ordered(toClone.begin(),
-                                                 toClone.end());
-    llvm::sort(ordered, [](mlir::Operation *a, mlir::Operation *b) {
-      return a->isBeforeInBlock(b);
-    });
+    // canEmitTeamsInTarget has checked that all of these are free of memory
+    // effects, so re-evaluating them in every thread is safe.
+    llvm::SmallVector<mlir::Operation *> ordered =
+        collectTargetBodyDependencies(doLoop, targetOp);
     for (mlir::Operation *op : ordered)
       rewriter.clone(*op, mapper);
     return ordered;

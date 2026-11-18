@@ -243,4 +243,169 @@ module attributes {omp.is_target_device = false} {
 // CHECK:           omp.terminator
 // CHECK-NEXT:    {{^ *}}}{{$}}
 
+// A loop bound read from memory (a mapped variable): re-reading it per
+// thread inside omp.parallel could observe writes made by iterations, so the
+// pass falls back to `parallel do`, which reads it once before omp.parallel.
+  func.func @bound_reads_memory(%arg0: !fir.ref<!fir.array<100xf32>> {fir.bindc_name = "a"}, %arg1: !fir.ref<f32> {fir.bindc_name = "m"}) {
+    %0 = fir.dummy_scope : !fir.dscope
+    %c100 = arith.constant 100 : index
+    %1 = fir.shape %c100 : (index) -> !fir.shape<1>
+    %2:2 = hlfir.declare %arg0(%1) dummy_scope %0 arg 1 uniq_name("_QFunrelated_readEa") : (!fir.ref<!fir.array<100xf32>>, !fir.shape<1>, !fir.dscope) -> (!fir.ref<!fir.array<100xf32>>, !fir.ref<!fir.array<100xf32>>)
+    %3 = fir.alloca i32 <{bindc_name = "i", uniq_name = "_QFunrelated_readEi"}>
+    %4:2 = hlfir.declare %3 uniq_name("_QFunrelated_readEi") : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+    %5:2 = hlfir.declare %arg1 dummy_scope %0 arg 2 uniq_name("_QFunrelated_readEm") : (!fir.ref<f32>, !fir.dscope) -> (!fir.ref<f32>, !fir.ref<f32>)
+    %c1 = arith.constant 1 : index
+    %c0 = arith.constant 0 : index
+    %6 = arith.subi %c100, %c1 : index
+    %7 = omp.map.bounds lower_bound(%c0 : index) upper_bound(%6 : index) extent(%c100 : index) stride(%c1 : index) start_idx(%c1 : index)
+    %8 = omp.map.info var_ptr(%2#1 : !fir.ref<!fir.array<100xf32>>, !fir.array<100xf32>) map_clauses(tofrom) capture(ByRef) bounds(%7) name("a") -> !fir.ref<!fir.array<100xf32>>
+    %9 = omp.map.info var_ptr(%5#1 : !fir.ref<f32>, f32) map_clauses(to) capture(ByRef) name("m") -> !fir.ref<f32>
+    omp.target kernel_type(generic) map_entries(%8 -> %arg2, %9 -> %arg3 : !fir.ref<!fir.array<100xf32>>, !fir.ref<f32>) {
+      %c100_0 = arith.constant 100 : index
+      %10 = fir.shape %c100_0 : (index) -> !fir.shape<1>
+      %11:2 = hlfir.declare %arg2(%10) uniq_name("_QFunrelated_readEa") : (!fir.ref<!fir.array<100xf32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<100xf32>>, !fir.ref<!fir.array<100xf32>>)
+      %12:2 = hlfir.declare %arg3 uniq_name("_QFunrelated_readEm") : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+      %c1_i32 = arith.constant 1 : i32
+      %13 = fir.convert %c1_i32 : (i32) -> index
+      %c100_i32 = arith.constant 100 : i32
+      %mval = fir.load %12#0 : !fir.ref<f32>
+      %14 = fir.convert %mval : (f32) -> index
+      %c1_1 = arith.constant 1 : index
+      fir.do_concurrent {
+        %15 = fir.alloca i32 <{bindc_name = "i", pinned}>
+        %16:2 = hlfir.declare %15 uniq_name("_QFunrelated_readEi") : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+        fir.do_concurrent.loop (%arg4) = (%13) to (%14) step (%c1_1) {
+          %17 = fir.convert %arg4 : (index) -> i32
+          fir.store %17 to %16#0 : !fir.ref<i32>
+          %cst = arith.constant 1.000000e+00 : f32
+          %18 = fir.load %16#0 : !fir.ref<i32>
+          %19 = fir.convert %18 : (i32) -> i64
+          %20 = hlfir.designate %11#0 (%19)  : (!fir.ref<!fir.array<100xf32>>, i64) -> !fir.ref<f32>
+          hlfir.assign %cst to %20 : f32, !fir.ref<f32>
+        }
+      }
+      omp.terminator
+    }
+    return
+  }
+
+// CHECK-LABEL: func.func @bound_reads_memory
+// CHECK:         omp.target kernel_type(generic)
+// CHECK-NOT:       omp.teams
+// CHECK:           omp.parallel {
+// CHECK:             omp.wsloop {
+// CHECK:           } {omp.combined}
+// CHECK:           omp.terminator
+// CHECK-NEXT:    {{^ *}}}{{$}}
+
+// An op in the `fir.do_concurrent` wrapper (outside the inner loop op) other
+// than the loop variable's storage, used by the loop body. The converted body
+// still uses it, so it must not be erased with the wrapper: being free of
+// memory effects, it is moved into omp.parallel and the teams nest is kept.
+// (Previously this crashed with "expected that op has no uses".)
+  func.func @wrapper_constant_used_by_body(%arg0: !fir.ref<!fir.array<100xf32>> {fir.bindc_name = "a"}, %arg1: !fir.ref<f32> {fir.bindc_name = "m"}) {
+    %0 = fir.dummy_scope : !fir.dscope
+    %c100 = arith.constant 100 : index
+    %1 = fir.shape %c100 : (index) -> !fir.shape<1>
+    %2:2 = hlfir.declare %arg0(%1) dummy_scope %0 arg 1 uniq_name("_QFunrelated_readEa") : (!fir.ref<!fir.array<100xf32>>, !fir.shape<1>, !fir.dscope) -> (!fir.ref<!fir.array<100xf32>>, !fir.ref<!fir.array<100xf32>>)
+    %3 = fir.alloca i32 <{bindc_name = "i", uniq_name = "_QFunrelated_readEi"}>
+    %4:2 = hlfir.declare %3 uniq_name("_QFunrelated_readEi") : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+    %5:2 = hlfir.declare %arg1 dummy_scope %0 arg 2 uniq_name("_QFunrelated_readEm") : (!fir.ref<f32>, !fir.dscope) -> (!fir.ref<f32>, !fir.ref<f32>)
+    %c1 = arith.constant 1 : index
+    %c0 = arith.constant 0 : index
+    %6 = arith.subi %c100, %c1 : index
+    %7 = omp.map.bounds lower_bound(%c0 : index) upper_bound(%6 : index) extent(%c100 : index) stride(%c1 : index) start_idx(%c1 : index)
+    %8 = omp.map.info var_ptr(%2#1 : !fir.ref<!fir.array<100xf32>>, !fir.array<100xf32>) map_clauses(tofrom) capture(ByRef) bounds(%7) name("a") -> !fir.ref<!fir.array<100xf32>>
+    %9 = omp.map.info var_ptr(%5#1 : !fir.ref<f32>, f32) map_clauses(to) capture(ByRef) name("m") -> !fir.ref<f32>
+    omp.target kernel_type(generic) map_entries(%8 -> %arg2, %9 -> %arg3 : !fir.ref<!fir.array<100xf32>>, !fir.ref<f32>) {
+      %c100_0 = arith.constant 100 : index
+      %10 = fir.shape %c100_0 : (index) -> !fir.shape<1>
+      %11:2 = hlfir.declare %arg2(%10) uniq_name("_QFunrelated_readEa") : (!fir.ref<!fir.array<100xf32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<100xf32>>, !fir.ref<!fir.array<100xf32>>)
+      %12:2 = hlfir.declare %arg3 uniq_name("_QFunrelated_readEm") : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+      %c1_i32 = arith.constant 1 : i32
+      %13 = fir.convert %c1_i32 : (i32) -> index
+      %c100_i32 = arith.constant 100 : i32
+      %14 = fir.convert %c100_i32 : (i32) -> index
+      %c1_1 = arith.constant 1 : index
+      fir.do_concurrent {
+        %15 = fir.alloca i32 <{bindc_name = "i", pinned}>
+        %16:2 = hlfir.declare %15 uniq_name("_QFunrelated_readEi") : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+        %w = arith.constant 7.000000e+00 : f32
+        fir.do_concurrent.loop (%arg4) = (%13) to (%14) step (%c1_1) {
+          %17 = fir.convert %arg4 : (index) -> i32
+          fir.store %17 to %16#0 : !fir.ref<i32>
+          %cst = arith.constant 1.000000e+00 : f32
+          %18 = fir.load %16#0 : !fir.ref<i32>
+          %19 = fir.convert %18 : (i32) -> i64
+          %20 = hlfir.designate %11#0 (%19)  : (!fir.ref<!fir.array<100xf32>>, i64) -> !fir.ref<f32>
+          hlfir.assign %w to %20 : f32, !fir.ref<f32>
+        }
+      }
+      omp.terminator
+    }
+    return
+  }
+
+// CHECK-LABEL: func.func @wrapper_constant_used_by_body
+// CHECK:         omp.target kernel_type(generic)
+// CHECK:           omp.teams {
+// CHECK-NEXT:        omp.parallel {
+// CHECK-NEXT:          %[[W:.*]] = arith.constant 7.000000e+00 : f32
+// CHECK:               omp.distribute {
+// CHECK:                 hlfir.assign %[[W]] to
+// CHECK:           } {omp.combined}
+
+// Same, but the wrapper op reads memory: it cannot be moved into
+// omp.parallel (it would be re-executed per thread), so the pass falls back.
+  func.func @wrapper_load_used_by_body(%arg0: !fir.ref<!fir.array<100xf32>> {fir.bindc_name = "a"}, %arg1: !fir.ref<f32> {fir.bindc_name = "m"}) {
+    %0 = fir.dummy_scope : !fir.dscope
+    %c100 = arith.constant 100 : index
+    %1 = fir.shape %c100 : (index) -> !fir.shape<1>
+    %2:2 = hlfir.declare %arg0(%1) dummy_scope %0 arg 1 uniq_name("_QFunrelated_readEa") : (!fir.ref<!fir.array<100xf32>>, !fir.shape<1>, !fir.dscope) -> (!fir.ref<!fir.array<100xf32>>, !fir.ref<!fir.array<100xf32>>)
+    %3 = fir.alloca i32 <{bindc_name = "i", uniq_name = "_QFunrelated_readEi"}>
+    %4:2 = hlfir.declare %3 uniq_name("_QFunrelated_readEi") : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+    %5:2 = hlfir.declare %arg1 dummy_scope %0 arg 2 uniq_name("_QFunrelated_readEm") : (!fir.ref<f32>, !fir.dscope) -> (!fir.ref<f32>, !fir.ref<f32>)
+    %c1 = arith.constant 1 : index
+    %c0 = arith.constant 0 : index
+    %6 = arith.subi %c100, %c1 : index
+    %7 = omp.map.bounds lower_bound(%c0 : index) upper_bound(%6 : index) extent(%c100 : index) stride(%c1 : index) start_idx(%c1 : index)
+    %8 = omp.map.info var_ptr(%2#1 : !fir.ref<!fir.array<100xf32>>, !fir.array<100xf32>) map_clauses(tofrom) capture(ByRef) bounds(%7) name("a") -> !fir.ref<!fir.array<100xf32>>
+    %9 = omp.map.info var_ptr(%5#1 : !fir.ref<f32>, f32) map_clauses(to) capture(ByRef) name("m") -> !fir.ref<f32>
+    omp.target kernel_type(generic) map_entries(%8 -> %arg2, %9 -> %arg3 : !fir.ref<!fir.array<100xf32>>, !fir.ref<f32>) {
+      %c100_0 = arith.constant 100 : index
+      %10 = fir.shape %c100_0 : (index) -> !fir.shape<1>
+      %11:2 = hlfir.declare %arg2(%10) uniq_name("_QFunrelated_readEa") : (!fir.ref<!fir.array<100xf32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<100xf32>>, !fir.ref<!fir.array<100xf32>>)
+      %12:2 = hlfir.declare %arg3 uniq_name("_QFunrelated_readEm") : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+      %c1_i32 = arith.constant 1 : i32
+      %13 = fir.convert %c1_i32 : (i32) -> index
+      %c100_i32 = arith.constant 100 : i32
+      %14 = fir.convert %c100_i32 : (i32) -> index
+      %c1_1 = arith.constant 1 : index
+      fir.do_concurrent {
+        %15 = fir.alloca i32 <{bindc_name = "i", pinned}>
+        %16:2 = hlfir.declare %15 uniq_name("_QFunrelated_readEi") : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+        %w = fir.load %12#0 : !fir.ref<f32>
+        fir.do_concurrent.loop (%arg4) = (%13) to (%14) step (%c1_1) {
+          %17 = fir.convert %arg4 : (index) -> i32
+          fir.store %17 to %16#0 : !fir.ref<i32>
+          %cst = arith.constant 1.000000e+00 : f32
+          %18 = fir.load %16#0 : !fir.ref<i32>
+          %19 = fir.convert %18 : (i32) -> i64
+          %20 = hlfir.designate %11#0 (%19)  : (!fir.ref<!fir.array<100xf32>>, i64) -> !fir.ref<f32>
+          hlfir.assign %w to %20 : f32, !fir.ref<f32>
+        }
+      }
+      omp.terminator
+    }
+    return
+  }
+
+// CHECK-LABEL: func.func @wrapper_load_used_by_body
+// CHECK:         omp.target kernel_type(generic)
+// CHECK-NOT:       omp.teams
+// CHECK:           omp.parallel {
+// CHECK:             omp.wsloop {
+// CHECK:           } {omp.combined}
+// CHECK:           omp.terminator
+// CHECK-NEXT:    {{^ *}}}{{$}}
 }
